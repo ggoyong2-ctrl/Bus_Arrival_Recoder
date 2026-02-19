@@ -32,8 +32,11 @@
 (사용승인되기 전에는 발급된 인증키를 입력하더라도 사용 불가함.)
 
    -> 서울특별시_버스도착정보조회 서비스 https://www.data.go.kr/data/15000314/openapi.do
+   
    -> 서울특별시_정류소정보조회 서비스 https://www.data.go.kr/data/15000303/openapi.do
+   
    -> 서울특별시_버스위치정보조회 서비스 https://www.data.go.kr/data/15000332/openapi.do
+   
    -> 서울특별시_노선정보조회 서비스 https://www.data.go.kr/data/15000193/openapi.do
 
 4. 각각의 API호출명 당, 각각 일일 1000트래픽이 부여되며, 호출명 당 1000건의 제한은 개인이 사용하기에는 다소 부족한 트래픽입니다.
