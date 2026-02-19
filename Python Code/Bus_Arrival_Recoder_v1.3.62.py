@@ -71,7 +71,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.61") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.62") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(1000, 400) 
