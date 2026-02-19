@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test file
+test_bus.py
+
+# Key config (security)
+key.cfg
+
+# Excel logs
+Bus_Arrival_Log_*.xlsx
+
+# macOS
+.DS_Store
