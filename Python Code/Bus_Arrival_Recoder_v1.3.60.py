@@ -179,7 +179,7 @@ class SeoulBusArrivalRecorder:
         # 5-1-9. API를 몇 번 호출했는지 세는 통계 숫자판입니다.
         # 5-1-9-1. 합산 통계(메인키 + 백업키 합계) — 메인 화면 상단에 표시됩니다.
         self.api_stats = {
-            "ARR": 0, "ALL": 0, "PosID": 0, "UID": 0, "POS": 0, "SRCH": 0, "RtSt": 0, "RtInf": 0, "StRt": 0, "VLD": 0
+            "ARR": 0, "ALL": 0, "UID": 0, "PosID": 0, "POS": 0, "SRCH": 0, "RtSt": 0, "RtInf": 0, "StRt": 0, "VLD": 0
         }
         # 5-1-9-2. 메인/백업 키별 개별 통계 — API 상세 창에서 구분 표시됩니다.
         self.api_stats_by_key = {
@@ -198,7 +198,7 @@ class SeoulBusArrivalRecorder:
             "RtSt": "http://ws.bus.go.kr/api/rest/stationinfo/getRouteByStation",
             "RtInf": "http://ws.bus.go.kr/api/rest/busRouteInfo/getRouteInfo",
             "StRt": "http://ws.bus.go.kr/api/rest/busRouteInfo/getStaionByRoute",
-            "VLD": "인증키 검증 (getBusRouteList)"
+            "VLD": "http://ws.bus.go.kr/api/rest/busRouteInfo/getBusRouteList  (인증키 검증)"
         }
         
         self.stats_win = None # 통계 창을 저장할 빈 공간
@@ -250,135 +250,126 @@ class SeoulBusArrivalRecorder:
         self.frame_ctrl_master = tk.Frame(self.top_container, pady=5, bg="#f1f2f6")
         self.frame_ctrl_master.pack(fill="x", side="top")
 
-        # 5-2-3-1. 엑셀 파일로 수동 저장하는 버튼
-        self.btn_save_excel = tk.Button(
-            self.frame_ctrl_master, 
-            text="다른 이름\n으로\n엑셀 저장", 
-            command=self.save_to_excel, 
-            padx=7, pady=12,
-            **self.get_btn_style("#28a745")
-        )
-        self.btn_save_excel.pack(side="right", padx=10, pady=5)
-
-        # 5-2-3-2. 버튼들을 담을 수평 공간
+        # 5-2-3-1. 버튼들을 담을 수평 공간
         frame_main_content = tk.Frame(self.frame_ctrl_master, bg="#f1f2f6")
         frame_main_content.pack(side="left", fill="x", expand=True)
         frame_row1 = tk.Frame(frame_main_content, bg="#f1f2f6")
         frame_row1.pack(fill="x", side="top")
 
-        # 5-2-3-3. 자동 저장 안내 문구
-        self.lbl_auto_save_status = tk.Label(frame_row1, text="자동 기록 시작 버튼을 작동시키면 도착 기록이 엑셀파일로 자동 저장됩니다.", font=(FONT_SUB, SZ_XS, "bold"), fg="#e74c3c", bg="#f1f2f6")
+        # 5-2-3-2. 자동 저장 안내 문구
+        self.lbl_auto_save_status = tk.Label(
+            frame_row1,
+            text="자동 기록 시작 버튼을 작동시키면 도착 기록이 엑셀파일로 자동 저장됩니다.",
+            font=(FONT_SUB, SZ_XS, "bold"), fg="#e74c3c", bg="#f1f2f6"
+        )
         self.lbl_auto_save_status.pack(side="left", padx=5)
 
-        # 5-2-3-4. 오른쪽 버튼들의 그룹
+        # 5-2-3-3. 오른쪽 버튼들의 그룹
         right_btn_group = tk.Frame(frame_row1, bg="#f1f2f6")
         right_btn_group.pack(side="right", padx=5)
 
-        # 5-2-3-5. 호출 횟수를 보여주는 창 열기 버튼
-        self.btn_api_stats = tk.Button(
-            right_btn_group, text="API 호출 현황", command=self.open_api_stats_window, 
-            width=11, **self.get_btn_style("#8e44ad")
+        # 5-2-3-4. [통합 시작/중지 버튼] 기록 중일 때는 "중지"(outline), 아닐 때는 "자동 기록 시작"(normal)
+        self.btn_toggle = tk.Button(
+            right_btn_group, text="자동 기록 시작",
+            command=self._on_toggle_monitoring, width=11,
+            **self.get_btn_style("normal")
         )
-        self.btn_api_stats.pack(side="right", padx=5)
+        self.btn_toggle.pack(side="right", padx=(15, 5))
 
-        # 5-2-3-6. 감시를 멈추는 버튼
-        self.btn_stop = tk.Button(right_btn_group, text="중지", 
-                                  command=self.stop_monitoring, width=4)
-        self.btn_stop.pack(side="right", padx=5)
-        
-        # 5-2-3-7. 지금 바로 정보를 가져오는 버튼
-        self.btn_manual = tk.Button(right_btn_group, text="수동 갱신", 
-                                    command=self.manual_refresh, width=7)
+        # 5-2-3-5. 지금 바로 정보를 가져오는 버튼
+        self.btn_manual = tk.Button(
+            right_btn_group, text="수동 갱신",
+            command=self.manual_refresh, width=7,
+            **self.get_btn_style("normal")
+        )
         self.btn_manual.pack(side="right", padx=5)
-        
-        # 5-2-3-8. 감시와 기록을 시작하는 버튼
-        self.btn_start = tk.Button(right_btn_group, text="자동 기록 시작", 
-                                   command=self.start_monitoring, width=11)
-        self.btn_start.pack(side="right", padx=(15, 5))
 
-        # 5-2-3-9. 얼마나 자주 정보를 가져올지 정하는 입력칸 설정
-        entry_base_opts = {
-            "bg": "white",
-            "fg": "black",
-            "insertbackground": "black",
-            "font": (FONT_MONO, SZ_S),
-            "readonlybackground": "#f0f0f0" 
+        # 5-2-3-6. 갱신 주기 입력칸 생성 및 배치
+        entry_ival_opts = {
+            "bg": "white", "fg": "black", "insertbackground": "black",
+            "font": (FONT_MONO, SZ_S), "readonlybackground": "#f0f0f0"
         }
-
-        # 5-2-3-10. 주기 입력칸 생성 및 배치
-        self.entry_refresh_interval = tk.Entry(right_btn_group, textvariable=self.refresh_interval_var, width=4, **entry_base_opts)
+        self.entry_refresh_interval = tk.Entry(
+            right_btn_group, textvariable=self.refresh_interval_var,
+            width=4, **entry_ival_opts
+        )
         self.entry_refresh_interval.pack(side="right", padx=2)
-        tk.Label(right_btn_group, text="갱신주기(초):", bg="#f1f2f6", font=(FONT_MAIN, SZ_S, "bold"), **mac_lbl_opts).pack(side="right", padx=(10, 2))
+        tk.Label(
+            right_btn_group, text="갱신주기(초):", bg="#f1f2f6",
+            font=(FONT_MAIN, SZ_S, "bold"), **mac_lbl_opts
+        ).pack(side="right", padx=(10, 2))
 
-        # 5-2-4. 인증키(비밀 열쇠)를 입력하는 줄을 만듭니다.
+        # 5-2-4. 2행: API현황 버튼 | 인증키 입력 영역 | 인증키버튼 | 엑셀저장버튼 | 통계숫자판
         frame_row2 = tk.Frame(frame_main_content, bg="#f1f2f6")
         frame_row2.pack(fill="x", side="top", padx=5, pady=2)
+
+        # 5-2-4-0. API 호출 현황 버튼 — ARR·SRCH 문구(통계숫자판)의 좌측
+        self.btn_api_stats = tk.Button(
+            frame_row2, text="API\n호출 현황",
+            command=self.open_api_stats_window,
+            width=7, **self.get_btn_style("normal")
+        )
+        self.btn_api_stats.pack(side="left", padx=(0, 6), fill="y")
+
+        # 5-2-4-1. 인증키 입력 영역
         key_input_area = tk.Frame(frame_row2, bg="#f1f2f6")
         key_input_area.pack(side="left", fill="y")
 
-        # 5-2-4-1. 입력창 디자인 (암호처럼 별표로 보이게 설정)
-        entry_base_opts = {
-            "show": "*",
-            "bg": "white",
-            "fg": "black",
-            "insertbackground": "black",
-            "font": (FONT_MONO, SZ_XXS),
-            "readonlybackground": "#f0f0f0" 
+        entry_key_opts = {
+            "show": "*", "bg": "white", "fg": "black",
+            "insertbackground": "black", "font": (FONT_MONO, SZ_XXS),
+            "readonlybackground": "#f0f0f0"
         }
-
-        # 5-2-4-2. 메인 인증키 입력 줄
         main_key_row = tk.Frame(key_input_area, bg="#f1f2f6")
         main_key_row.pack(fill="x", pady=1)
         tk.Label(main_key_row, text="메인인증키 :", font=(FONT_MAIN, SZ_S), bg="#f1f2f6", **mac_lbl_opts).pack(side="left")
-        self.entry_service_key = tk.Entry(main_key_row, textvariable=self.service_key_var, width=68, **entry_base_opts)
+        self.entry_service_key = tk.Entry(main_key_row, textvariable=self.service_key_var, width=68, **entry_key_opts)
         self.entry_service_key.pack(side="left", padx=2)
 
-        # 5-2-4-3. 백업 인증키 입력 줄
         backup_key_row = tk.Frame(key_input_area, bg="#f1f2f6")
         backup_key_row.pack(fill="x", pady=1)
         tk.Label(backup_key_row, text="백업인증키 :", font=(FONT_MAIN, SZ_S), bg="#f1f2f6", **mac_lbl_opts).pack(side="left")
-        self.entry_backup_key = tk.Entry(backup_key_row, textvariable=self.backup_key_var, width=68, **entry_base_opts)
+        self.entry_backup_key = tk.Entry(backup_key_row, textvariable=self.backup_key_var, width=68, **entry_key_opts)
         self.entry_backup_key.pack(side="left", padx=2)
 
-        # 5-2-4-4. 인증키가 맞는지 확인하고 잠그는 버튼
-        self.btn_key_manage = tk.Button(frame_row2, text="인증키\n입력", 
-                                        command=self.toggle_key_lock, width=10, 
-                                        **self.get_btn_style("#7f8c8d"))
-        self.btn_key_manage.pack(side="left", padx=10, fill="y")
+        # 5-2-4-2. 인증키 확인/잠금 버튼 — outline 스타일, 폭 기존 10→7 (약 2/3)
+        self.btn_key_manage = tk.Button(
+            frame_row2, text="인증키\n입력",
+            command=self.toggle_key_lock, width=7,
+            **self.get_btn_style("outline")
+        )
+        self.btn_key_manage.pack(side="left", padx=(6, 2), fill="y")
 
-        # 5-2-5. API 통계 숫자판을 2행 5열 그리드로 예쁘게 배치합니다.
-        # 5-2-5-0. 각 셀을 [약칭 | 숫자] 두 칸으로 나눠 좌측 정렬하여
-        #          약칭끼리/숫자끼리 세로로 정렬되는 모습을 만듭니다.
+        # 5-2-4-3. 다른 이름으로 엑셀 저장 버튼 — 한 줄, 최소 폰트, 우측 배치
+        _save_style = dict(self.get_btn_style("normal"))
+        _save_style["font"] = (FONT_MAIN, SZ_XXS, "bold")
+        self.btn_save_excel = tk.Button(
+            frame_row2, text="다른 이름으로 엑셀 저장",
+            command=self.save_to_excel, **_save_style
+        )
+        self.btn_save_excel.pack(side="right", padx=(4, 8), fill="y")
+
+        # 5-2-5. API 통계 숫자판 — 2행 5열, PosID ↔ UID 위치 맞바꿈
         self.api_stats_container = tk.Frame(frame_row2, bg="#f1f2f6")
         self.api_stats_container.pack(side="right", padx=(10, 0))
-        self.stat_value_labels = {} 
+        self.stat_value_labels = {}
         stat_layout = [
-            ["ARR", "ALL", "PosID", "UID", "POS"],
+            ["ARR", "ALL", "UID", "PosID", "POS"],
             ["SRCH", "RtSt", "RtInf", "StRt", "VLD"]
         ]
-
-        # 5-2-5-1. 표 모양으로 라벨들을 하나씩 생성합니다.
-        #          각 열: c*2 = 약칭 라벨, c*2+1 = 숫자 라벨  (anchor="w" 로 왼쪽 정렬)
         for r, row_keys in enumerate(stat_layout):
             for c, key in enumerate(row_keys):
-                # 5-2-5-1-1. 약칭 라벨: 고정 너비로 왼쪽 정렬합니다.
                 tk.Label(
-                    self.api_stats_container, 
-                    text=key, 
-                    font=(FONT_MONO, SZ_XS, "bold"),
-                    fg="#636e72", bg="#f1f2f6",
-                    width=5, anchor="w"
-                ).grid(row=r, column=c*2, padx=(6, 0), sticky="w") 
-
-                # 5-2-5-1-2. 숫자 라벨: 고정 너비로 왼쪽 정렬합니다.
+                    self.api_stats_container,
+                    text=key, font=(FONT_MONO, SZ_XS, "bold"),
+                    fg="#636e72", bg="#f1f2f6", width=5, anchor="w"
+                ).grid(row=r, column=c*2, padx=(6, 0), sticky="w")
                 val_lbl = tk.Label(
-                    self.api_stats_container, 
-                    text="0", 
-                    font=(FONT_MONO, SZ_XS, "bold"),
-                    fg="#2d3436", bg="#f1f2f6",
-                    width=4, anchor="w"
+                    self.api_stats_container,
+                    text="0", font=(FONT_MONO, SZ_XS, "bold"),
+                    fg="#2d3436", bg="#f1f2f6", width=4, anchor="w"
                 )
-                val_lbl.grid(row=r, column=c*2 + 1, padx=(0, 4), sticky="w") 
+                val_lbl.grid(row=r, column=c*2+1, padx=(0, 4), sticky="w")
                 self.stat_value_labels[key] = val_lbl
 
         # 5-2-6. 초기 화면 상태를 업데이트합니다.
@@ -401,7 +392,8 @@ class SeoulBusArrivalRecorder:
         # 5-2-9. 화면 제일 아래쪽에 작업 일지(로그)를 적는 까만 창을 만듭니다.
         log_outer_frame = tk.Frame(self.super_paned, padx=10, pady=5)
         log_scroll_frame = tk.Frame(log_outer_frame); log_scroll_frame.pack(fill="both", expand=True)
-        self.txt_log = tk.Text(log_scroll_frame, height=10, bg="#2d3436", fg="#dfe6e9", font=(FONT_MONO, SZ_S))
+        self.txt_log = tk.Text(log_scroll_frame, height=10, bg="#2d3436", fg="#dfe6e9",
+                               font=(FONT_MONO, SZ_S), state="disabled")  # 5-2-9-1. 읽기전용: 타이핑으로 수정 불가
         log_scrollbar = ttk.Scrollbar(log_scroll_frame, orient="vertical", command=self.txt_log.yview)
         self.txt_log.configure(yscrollcommand=log_scrollbar.set)
         self.txt_log.pack(side="left", fill="both", expand=True); log_scrollbar.pack(side="right", fill="y")
@@ -486,36 +478,97 @@ class SeoulBusArrivalRecorder:
     # 3그룹 : UI 보조 함수 (UI Auxiliary function)
 
     # 5-4. [버튼 옷입히기] 컴퓨터 종류와 버튼 상태에 따라 모양을 정해주는 함수
-    def get_btn_style(self, theme_color, state="normal", font_size=None):
+    # 5-4-0. [버튼 디자인 가이드]
+    #   btn_type="normal"  : 진한 초록 배경(#2ecc71) + 흰색 글자  — 일반 활성 버튼
+    #   btn_type="outline" : 초록 테두리(#2ecc71) + 초록 글자     — 인증키변경·중지 버튼
+    #   btn_type="pressed" : 흰 배경 + 초록 테두리 + 초록 글자    — 눌린 상태(active)
+    #   btn_type="disabled": 연회색 배경(#e0e0e0) + 회색 글자     — 비활성 버튼
+    #   macOS에서는 배경색이 무시되므로 별도 분기로 처리합니다.
+    def get_btn_style(self, btn_type="normal", font_size=None):
+        # 5-4-0-1. 하위 호환: 구버전에서 theme_color 문자열을 넘길 경우 자동 매핑합니다.
+        _color_map = {
+            "#28a745": "normal", "#007bff": "normal", "#8e44ad": "normal",
+            "#f1c40f": "normal", "#2ecc71": "normal",
+            "#d63031": "outline", "#7f8c8d": "outline",
+        }
+        if btn_type.startswith("#"):
+            btn_type = _color_map.get(btn_type, "normal")
+
         target_sz = font_size if font_size else SZ_S
-        
-        # 5-4-1. 맥(Apple) 컴퓨터일 때의 디자인
-        if CURRENT_OS == "Darwin":  
-            if state == "disabled" or state == tk.DISABLED:
+
+        # 5-4-1. 색상 팔레트 정의
+        C_GREEN      = "#2ecc71"   # 진한 초록 배경
+        C_GREEN_DARK = "#27ae60"   # hover/active 초록
+        C_GREEN_PALE = "#d5f5e3"   # outline 버튼 배경
+        C_GRAY_BG    = "#e0e0e0"   # disabled 배경
+        C_GRAY_FG    = "#a0a0a0"   # disabled 글자
+        C_WHITE      = "#ffffff"
+
+        if CURRENT_OS == "Darwin":
+            # 5-4-1-1. macOS: 배경색 설정이 제한적이므로 글자색+커서+테두리로 표현합니다.
+            if btn_type == "disabled":
                 return {
-                    "fg": "#b2bec3", 
+                    "fg": C_GRAY_FG,
                     "font": (FONT_MAIN, target_sz, "normal"),
                     "cursor": "arrow",
                     "highlightthickness": 0,
                     "relief": "flat",
-                    "state": "normal" 
+                    "state": "normal",
                 }
-            else:
+            elif btn_type == "outline":
                 return {
-                    "fg": theme_color, 
+                    "fg": C_GREEN_DARK,
                     "font": (FONT_MAIN, target_sz, "bold"),
-                    "cursor": "hand2",
-                    "highlightthickness": 0,
-                    "activeforeground": theme_color
+                    "cursor": "pointinghand" if CURRENT_OS == "Darwin" else "hand2",
+                    "highlightthickness": 1,
+                    "highlightbackground": C_GREEN_DARK,
+                    "relief": "flat",
+                    "activeforeground": C_GREEN_DARK,
                 }
-        # 5-4-2. 윈도우 컴퓨터일 때의 디자인
-        else:  
-            win_fg = "#2c3e50" if theme_color == "#dfe6e9" else "#ffffff"
-            return {
-                "bg": theme_color, 
-                "fg": win_fg, 
-                "font": (FONT_MAIN, target_sz, "bold")
-            }
+            else:  # normal
+                return {
+                    "fg": C_GREEN_DARK,
+                    "font": (FONT_MAIN, target_sz, "bold"),
+                    "cursor": "pointinghand" if CURRENT_OS == "Darwin" else "hand2",
+                    "highlightthickness": 0,
+                    "relief": "flat",
+                    "activeforeground": C_GREEN_DARK,
+                }
+        else:
+            # 5-4-1-2. Windows: 배경/글자색 모두 적용합니다.
+            if btn_type == "disabled":
+                return {
+                    "bg": C_GRAY_BG,
+                    "fg": C_GRAY_FG,
+                    "font": (FONT_MAIN, target_sz, "normal"),
+                    "relief": "flat",
+                    "cursor": "arrow",
+                    "state": "disabled",
+                    "disabledforeground": C_GRAY_FG,
+                }
+            elif btn_type == "outline":
+                return {
+                    "bg": C_GREEN_PALE,
+                    "fg": C_GREEN_DARK,
+                    "activebackground": C_WHITE,
+                    "activeforeground": C_GREEN_DARK,
+                    "font": (FONT_MAIN, target_sz, "bold"),
+                    "relief": "flat",
+                    "bd": 2,
+                    "highlightbackground": C_GREEN_DARK,
+                    "highlightthickness": 1,
+                    "cursor": "hand2",
+                }
+            else:  # normal
+                return {
+                    "bg": C_GREEN,
+                    "fg": C_WHITE,
+                    "activebackground": C_WHITE,
+                    "activeforeground": C_GREEN_DARK,
+                    "font": (FONT_MAIN, target_sz, "bold"),
+                    "relief": "flat",
+                    "cursor": "hand2",
+                }
         
     # 5-5. [이름표 번역] 영어로 된 데이터 이름을 한글로 알기 쉽게 바꿔주는 함수
     def get_col_name(self, code):
@@ -608,33 +661,42 @@ class SeoulBusArrivalRecorder:
     # 5-11. [스위치 조절] 상황(감시 중인지 등)에 따라 버튼들을 켜거나 끄는 함수
     def update_button_states(self):
         # 5-11-1. 정류소 정보가 있는지 먼저 확인합니다.
-        has_info = (bool(self.target_st_info[0].get('routes')) or 
+        has_info = (bool(self.target_st_info[0].get('routes')) or
                     bool(self.target_st_info[1].get('routes')))
-        
-        # 5-11-2. 버튼의 작동 여부와 색상을 입혀주는 도우미 기능
-        def apply_state(btn, color, is_active, cmd):
-            style = self.get_btn_style(color, state=("normal" if is_active else "disabled"))
-            if CURRENT_OS == "Darwin":
-                true_cmd = cmd if is_active else None
-                btn.config(command=true_cmd, **style)
-            else:
-                true_state = "normal" if is_active else "disabled"
-                btn.config(state=true_state, **style)
 
-        # 5-11-3. 지금 버스를 감시하고 있는 중일 때의 버튼 상태입니다.
-        if self.is_monitoring:
-            apply_state(self.btn_start, "#007bff", False, self.start_monitoring)
-            apply_state(self.btn_stop, "#d63031", True, self.stop_monitoring)
-            apply_state(self.btn_manual, "#f1c40f", True, self.manual_refresh)
-        # 5-11-4. 감시를 하지 않고 쉬고 있을 때의 버튼 상태입니다.
-        else:
-            apply_state(self.btn_stop, "#d63031", False, self.stop_monitoring)
-            if has_info:
-                apply_state(self.btn_start, "#007bff", True, self.start_monitoring)
-                apply_state(self.btn_manual, "#f1c40f", True, self.manual_refresh)
+        # 5-11-2. 버튼의 작동 여부를 설정하는 도우미 함수
+        def apply_btn(btn, btn_type, is_active, cmd, text=None):
+            # 5-11-2-1. 비활성 상태라면 disabled 스타일로 덮어씁니다.
+            effective_type = btn_type if is_active else "disabled"
+            style = self.get_btn_style(effective_type)
+            if text:
+                style["text"] = text
+            if CURRENT_OS == "Darwin":
+                btn.config(command=(cmd if is_active else None), **style)
+                if not is_active:
+                    btn.config(state="normal")  # macOS: disabled 외관은 스타일로만 처리
             else:
-                apply_state(self.btn_start, "#007bff", False, self.start_monitoring)
-                apply_state(self.btn_manual, "#f1c40f", False, self.manual_refresh)
+                btn.config(state=("normal" if is_active else "disabled"),
+                           command=(cmd if is_active else lambda: None), **style)
+
+        # 5-11-3. 감시 중일 때 → 통합 버튼을 "중지"(outline), 수동 갱신 활성화
+        if self.is_monitoring:
+            apply_btn(self.btn_toggle, "outline", True,
+                      self.stop_monitoring, text="중지")
+            apply_btn(self.btn_manual, "normal", True, self.manual_refresh)
+        # 5-11-4. 감시 중이 아닐 때 → 통합 버튼을 "자동 기록 시작"
+        else:
+            apply_btn(self.btn_toggle, "normal", has_info,
+                      self.start_monitoring, text="자동 기록 시작")
+            apply_btn(self.btn_manual, "normal", has_info, self.manual_refresh)
+
+    # 5-11-5. [통합 토글] 시작/중지 버튼 클릭 시 현재 상태에 따라 분기합니다.
+    def _on_toggle_monitoring(self):
+        if self.is_monitoring:
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+
 
     # 5-12. [숫자판 업데이트] 메인 화면의 API 호출 횟수를 실시간으로 갱신하는 함수
     def update_api_counter_ui(self):
@@ -1743,12 +1805,15 @@ class SeoulBusArrivalRecorder:
 
         def _do_insert():
             try:
+                # 5-29-2-2. 읽기전용(disabled) 위젯에 쓰려면 잠시 NORMAL로 열었다가 다시 닫습니다.
+                self.txt_log.config(state="normal")
                 self.txt_log.insert(tk.END, line)
                 self.txt_log.see(tk.END)
                 # 5-29-3. 로그 5,000줄이 넘어가면 가장 오래된(제일 위) 줄부터 지웁니다.
                 line_count = int(self.txt_log.index('end-1c').split('.')[0])
                 if line_count > 5000:
                     self.txt_log.delete('1.0', '2.0')
+                self.txt_log.config(state="disabled")
             except Exception:
                 pass  # 5-29-3-1. 창이 닫히는 도중 예외가 발생해도 무시합니다.
 
