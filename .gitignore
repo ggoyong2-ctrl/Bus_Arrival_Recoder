@@ -5,6 +5,7 @@ __pycache__/
 
 # Test file
 test_bus.py
+Python Code/test_bus.py
 
 # Key config (security)
 key.cfg
