@@ -73,7 +73,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.68") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.69") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -453,7 +453,8 @@ class SeoulBusArrivalRecorder:
             tk.Entry(inner_header, textvariable=self.ars_ids[i], width=10, state="readonly", readonlybackground="#f0f0f0", fg="#2d3436", font=(FONT_MONO, SZ_M, "bold")).pack(side="left", padx=5)
             
             # 5-3-1-3. 버스 정류소를 찾기 위한 검색 버튼을 만듭니다.
-            _s_search = self.get_btn_style("normal")
+            # 비활성 상태(disabled) 초기값: disabled 스타일로 회색 배경 표시
+            _s_search = self.get_btn_style("disabled")
             _s_search.pop("state", None)
             btn_search = tk.Button(inner_header, text="검색",
                                   command=lambda idx=i: self.open_search_window(idx),
@@ -490,7 +491,8 @@ class SeoulBusArrivalRecorder:
             # 5-3-2-1. 도착 기록판 제목과 기록 삭제 버튼을 만듭니다.
             lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 도착 기록", fg="#d63031", font=(FONT_SUB, SZ_M, "bold"))
             lbl.pack(side="left"); self.lbl_hist_titles.append(lbl)
-            _s_del = self.get_btn_style("normal")
+            # 기록 삭제 버튼: normal 스타일, 폰트 크기는 SZ_XS(한 단계 작게)
+            _s_del = self.get_btn_style("normal", font_size=SZ_XS)
             tk.Button(inner_header, text="기록 삭제",
                       command=lambda idx=i: self.clear_history(idx),
                       **_s_del).pack(side="left", padx=10, ipady=1)
@@ -925,8 +927,10 @@ class SeoulBusArrivalRecorder:
                 self.btn_key_manage.config(text="인증키\n변경", **_outline)
                 
                 # 5-15-1-5-3. 이제 버스를 찾을 수 있도록 검색 버튼들을 켭니다.
+                _s_on = self.get_btn_style("normal")
+                _s_on.pop("state", None)
                 for btn in self.btn_searches:
-                    btn.config(state="normal")
+                    btn.config(state="normal", **_s_on)
                 
                 # 5-15-1-5-4. VLD 통계 숫자를 올리고 열쇠를 파일에 저장합니다.
                 #             성공한 각 키(메인/백업)별로 개별 카운터도 올립니다.
@@ -955,8 +959,10 @@ class SeoulBusArrivalRecorder:
             self.btn_key_manage.config(text="인증키\n입력", **_normal)
             
             # 5-15-2-2. 열쇠를 고치는 동안에는 검색 버튼을 못 누르게 끕니다.
+            _s_off = self.get_btn_style("disabled")
+            _s_off.pop("state", None)
             for btn in self.btn_searches:
-                btn.config(state="disabled")
+                btn.config(state="disabled", **_s_off)
             
             # 5-15-2-3. 잠금 해제 즉시 64자 검증을 다시 적용합니다.
             self._check_key_btn_state()
@@ -1825,8 +1831,10 @@ class SeoulBusArrivalRecorder:
         self.save_key_to_file()
         self.is_monitoring = True
         # 자동 기록 중에는 정류소 검색 버튼을 비활성화합니다.
+        _s_off2 = self.get_btn_style("disabled")
+        _s_off2.pop("state", None)
         for _b in self.btn_searches:
-            _b.config(state="disabled")
+            _b.config(state="disabled", **_s_off2)
         
         # 5-22-3. 오늘 기록을 저장할 새 엑셀 파일을 하나 만듭니다.
         filename = f"Bus_Arrival_Log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1895,8 +1903,10 @@ class SeoulBusArrivalRecorder:
         self.is_monitoring = False
         # 자동 기록 중지 후 키가 잠긴 상태면 검색 버튼을 다시 활성화합니다.
         if self.key_locked:
+            _s_on2 = self.get_btn_style("normal")
+            _s_on2.pop("state", None)
             for _b in self.btn_searches:
-                _b.config(state="normal")
+                _b.config(state="normal", **_s_on2)
         self.log("🛑 자동 기록을 중지합니다.")
         
         # 5-26-1. 이제 주기를 다시 고칠 수 있게 입력창을 엽니다.
