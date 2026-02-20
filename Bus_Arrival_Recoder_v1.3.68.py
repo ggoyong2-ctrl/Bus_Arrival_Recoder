@@ -36,11 +36,13 @@ else:
     FONT_SUB = "Apple SD Gothic Neo" 
     FONT_MONO = "Menlo"              
     # 3-2-1. 맥은 글자가 작게 보여서 1.4배 정도 키워줍니다.
-    SZ_L = int(15 * 1.7)
-    SZ_M = int(11 * 1.4)
-    SZ_S = int(9 * 1.4)
-    SZ_XS = int(8 * 1.4)
-    SZ_XXS = int(7 * 1.4)
+    # 3-2-1. macOS 버튼 크기가 Windows보다 크게 보이는 문제를 방지하기 위해
+    #        배율을 1.4→1.15 수준으로 낮춥니다.
+    SZ_L = 19
+    SZ_M = 11
+    SZ_S = 9
+    SZ_XS = 8
+    SZ_XXS = 7
 
 # 4. [창고 검사] 프로그램을 돌릴 때 필요한 특수 도구들이 다 있는지 확인합니다.
 try:
@@ -71,7 +73,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.67") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.68") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -162,6 +164,7 @@ class SeoulBusArrivalRecorder:
         # 5-1-8-7. POS1 일시정지 테이블: 차량 없음 확인 시 첫차 시각까지 호출을 건너뜁니다.
         #   {rid: datetime}  — 정지 해제 시각 (이 시각이 되면 다시 호출 허용)
         self.pos_suspend_until = {}
+        self.pos_resume_logged = set()  # POS 재개 로그 중복 방지: 한 번만 기록
         # 5-1-8-8. 마지막 날짜 체크: 자정 이후 suspend 초기화에 사용합니다.
         self._last_date = datetime.now().date()
         # 5-1-8-9. SLST(getStaionByRoute) 캐시: 노선 ID → 전체 정류소 목록.
@@ -307,15 +310,13 @@ class SeoulBusArrivalRecorder:
         )
         self.btn_manual.pack(side="left", padx=(0, PAD), ipady=4)
 
-        # 다른 이름으로 엑셀 저장 — 1줄, 가장 작은 글씨
-        # height=BTN_H + ipady=4 로 btn_toggle/btn_manual 과 동일한 표시 높이를 강제합니다.
-        _save_style = dict(self.get_btn_style("normal"))
-        _save_style["font"] = (FONT_MAIN, SZ_XXS, "bold")
+        # 다른 이름으로 엑셀 저장 — 1줄, 상단 버튼들과 동일한 폰트·높이
         self.btn_save_excel = tk.Button(
             right_r1, text="다른 이름으로 엑셀 저장",
-            command=self.save_to_excel, height=BTN_H, **_save_style
+            command=self.save_to_excel, height=BTN_H,
+            **self.get_btn_style("normal")
         )
-        self.btn_save_excel.pack(side="left", padx=(0, 5), ipady=4)
+        self.btn_save_excel.pack(side="left", padx=(0, 8), ipady=4)
 
         # ══════════════════════════════════════════════════════════════════
         # 2행: 좌=(인증키 입력창 + 인증키버튼)  /  우=(API현황버튼 + API카운트표)
@@ -373,7 +374,7 @@ class SeoulBusArrivalRecorder:
         self.btn_api_stats.pack(side="left", padx=(0, 4), fill="y")
 
         self.api_stats_container = tk.Frame(right_r2, bg="#f1f2f6")
-        self.api_stats_container.pack(side="left", fill="y")
+        self.api_stats_container.pack(side="left", fill="y", anchor="center")
         self.stat_value_labels = {}
         stat_layout = [
             ["ARR1", "ARR2", "SINF", "POS1", "POS2"],
@@ -452,11 +453,12 @@ class SeoulBusArrivalRecorder:
             tk.Entry(inner_header, textvariable=self.ars_ids[i], width=10, state="readonly", readonlybackground="#f0f0f0", fg="#2d3436", font=(FONT_MONO, SZ_M, "bold")).pack(side="left", padx=5)
             
             # 5-3-1-3. 버스 정류소를 찾기 위한 검색 버튼을 만듭니다.
-            btn_search = tk.Button(inner_header, text="검색", 
-                                  command=lambda idx=i: self.open_search_window(idx), 
-                                  width=5, font=(FONT_SUB, SZ_M),
-                                  state="disabled") 
-            btn_search.pack(side="left")
+            _s_search = self.get_btn_style("normal")
+            _s_search.pop("state", None)
+            btn_search = tk.Button(inner_header, text="검색",
+                                  command=lambda idx=i: self.open_search_window(idx),
+                                  width=5, state="disabled", **_s_search)
+            btn_search.pack(side="left", padx=(4, 0), ipady=1)
             self.btn_searches.append(btn_search) 
 
             # 5-3-1-4. 실시간 도착 정보 표(Treeview)를 설정합니다.
@@ -488,7 +490,10 @@ class SeoulBusArrivalRecorder:
             # 5-3-2-1. 도착 기록판 제목과 기록 삭제 버튼을 만듭니다.
             lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 도착 기록", fg="#d63031", font=(FONT_SUB, SZ_M, "bold"))
             lbl.pack(side="left"); self.lbl_hist_titles.append(lbl)
-            tk.Button(inner_header, text="기록 삭제", font=(FONT_SUB, SZ_XS), command=lambda idx=i: self.clear_history(idx)).pack(side="left", padx=10)
+            _s_del = self.get_btn_style("normal")
+            tk.Button(inner_header, text="기록 삭제",
+                      command=lambda idx=i: self.clear_history(idx),
+                      **_s_del).pack(side="left", padx=10, ipady=1)
 
             # 5-3-2-2. 도착 기록 표(Treeview)를 설정합니다.
             tree_frame = tk.Frame(f); tree_frame.pack(fill="both", expand=True)
@@ -1570,9 +1575,11 @@ class SeoulBusArrivalRecorder:
                         # 아직 재개 시각 전 → POS 호출 생략
                         continue
                     else:
-                        # 재개 시각 도달 → 정지 해제
+                        # 재개 시각 도달 → 정지 해제 (최초 1회만 로그 출력)
                         del self.pos_suspend_until[rid]
-                        self.log(f"⏰ {rnm}번 POS 호출 재개 (첫차 5분 전 도달)")
+                        if rid not in self.pos_resume_logged:
+                            self.log(f"⏰ {rnm}번 POS 호출 재개 (첫차 5분 전 도달)")
+                            self.pos_resume_logged.add(rid)
 
                 # 5-18-3-2. [스마트 판단] 이미 다른 정류소에서 이 노선의 위치 정보를 가져왔는지 확인합니다.
                 if rid in self.temp_pos_data:
@@ -1593,15 +1600,24 @@ class SeoulBusArrivalRecorder:
                                 if base_dt <= now_dt:
                                     base_dt += timedelta(days=1)
                                 resume_dt = base_dt - timedelta(minutes=5)
-                                self.pos_suspend_until[rid] = resume_dt
-                                self.log(f"💤 {rnm}번 차량 없음 → 첫차 {f_tm_str} 5분 전({resume_dt.strftime('%H:%M')})까지 POS 정지")
+                                if resume_dt > now_dt:
+                                    # 아직 재개 시각이 오지 않음 → 재개 시각까지 정지
+                                    self.pos_suspend_until[rid] = resume_dt
+                                    self.pos_resume_logged.discard(rid)
+                                    self.log(f"💤 {rnm}번 차량 없음 → 첫차 {f_tm_str} 5분 전({resume_dt.strftime('%H:%M')})까지 POS 정지")
+                                else:
+                                    # 이미 5분 전 창 안에 있지만 아직 차량 없음 → 1분 후 재시도 (로그 없음)
+                                    self.pos_suspend_until[rid] = now_dt + timedelta(minutes=1)
+                                    # pos_resume_logged는 유지 (중복 로그 방지)
                             except Exception:
                                 # 파싱 실패시 30분 후 재시도
                                 self.pos_suspend_until[rid] = now_dt + timedelta(minutes=30)
+                                self.pos_resume_logged.discard(rid)
                                 self.log(f"💤 {rnm}번 차량 없음 → 첫차 시각 파싱 실패, 30분 후 재시도")
                         else:
                             # 첫차 시각 없음: 30분 후 재시도
                             self.pos_suspend_until[rid] = now_dt + timedelta(minutes=30)
+                            self.pos_resume_logged.discard(rid)
                             self.log(f"💤 {rnm}번 차량 없음 → 첫차 정보 없음, 30분 후 재시도")
                         continue  # POS 처리 건너뜀
 
@@ -1807,7 +1823,10 @@ class SeoulBusArrivalRecorder:
         self.entry_refresh_interval.config(state='readonly')
         
         self.save_key_to_file()
-        self.is_monitoring = True 
+        self.is_monitoring = True
+        # 자동 기록 중에는 정류소 검색 버튼을 비활성화합니다.
+        for _b in self.btn_searches:
+            _b.config(state="disabled")
         
         # 5-22-3. 오늘 기록을 저장할 새 엑셀 파일을 하나 만듭니다.
         filename = f"Bus_Arrival_Log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1874,6 +1893,10 @@ class SeoulBusArrivalRecorder:
     # 5-26. [기록 멈춤] 하던 일을 멈추고 쉬는 단계로 돌아가는 함수
     def stop_monitoring(self):
         self.is_monitoring = False
+        # 자동 기록 중지 후 키가 잠긴 상태면 검색 버튼을 다시 활성화합니다.
+        if self.key_locked:
+            for _b in self.btn_searches:
+                _b.config(state="normal")
         self.log("🛑 자동 기록을 중지합니다.")
         
         # 5-26-1. 이제 주기를 다시 고칠 수 있게 입력창을 엽니다.
