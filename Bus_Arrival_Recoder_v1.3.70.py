@@ -73,7 +73,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.69") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.70") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -167,6 +167,10 @@ class SeoulBusArrivalRecorder:
         self.pos_resume_logged = set()  # POS 재개 로그 중복 방지: 한 번만 기록
         # 5-1-8-8. 마지막 날짜 체크: 자정 이후 suspend 초기화에 사용합니다.
         self._last_date = datetime.now().date()
+        # 5-1-8-9. [macOS 전용] Aqua 테마에서 state='disabled'가 클릭을 막지 못하는
+        #          버그를 우회하기 위해 버튼별 활성화 플래그를 별도 관리합니다.
+        #          apply_btn() 호출 시 동기화하고, 각 핸들러 진입 시 guard 체크합니다.
+        self._btn_active = {'toggle': False, 'manual': False}
         # 5-1-8-9. SLST(getStaionByRoute) 캐시: 노선 ID → 전체 정류소 목록.
         #   on_station_select 에서 노선당 1회만 호출하고 confirm_selection 에서 재사용합니다.
         #   정류소 선택이 바뀔 때마다 초기화됩니다.
@@ -757,7 +761,15 @@ class SeoulBusArrivalRecorder:
             #           style 딕셔너리에 state 가 같이 있으면 "multiple values" TypeError 발생.
             style.pop("state", None)
             if CURRENT_OS == "Darwin":
-                btn.config(state="normal", command=(cmd if is_active else None), **style)
+                # macOS(Aqua 테마) 버그 우회:
+                #   state='disabled' 를 설정해도 실제 클릭이 통과되는 경우가 있습니다.
+                #   _btn_active 플래그를 함께 갱신하여 핸들러 진입 시 guard 체크합니다.
+                if btn is self.btn_toggle:
+                    self._btn_active['toggle'] = is_active
+                elif btn is self.btn_manual:
+                    self._btn_active['manual'] = is_active
+                btn.config(state=("normal" if is_active else "disabled"),
+                           command=(cmd if is_active else lambda: None), **style)
             else:
                 btn.config(state=("normal" if is_active else "disabled"),
                            command=(cmd if is_active else lambda: None), **style)
@@ -775,6 +787,9 @@ class SeoulBusArrivalRecorder:
 
     # 5-11-5. [통합 토글] 시작/중지 버튼 클릭 시 현재 상태에 따라 분기합니다.
     def _on_toggle_monitoring(self):
+        # macOS guard: Aqua 테마의 state='disabled' 클릭 통과 버그 차단
+        if CURRENT_OS == "Darwin" and not self._btn_active.get('toggle', True):
+            return
         if self.is_monitoring:
             self.stop_monitoring()
         else:
@@ -1872,14 +1887,26 @@ class SeoulBusArrivalRecorder:
 
     # 5-24. [지금 바로] 기다리지 않고 당장 정보를 새로 가져오는 함수
     def manual_refresh(self):
-        self.btn_manual.config(state="disabled")
+        # macOS guard: Aqua 테마의 state='disabled' 클릭 통과 버그 차단
+        if CURRENT_OS == "Darwin" and not self._btn_active.get('manual', True):
+            return
+        # 갱신 중 중복 클릭 방지: 플래그와 state 동시 비활성화
+        self._btn_active['manual'] = False
+        _s_dis = self.get_btn_style("disabled")
+        _s_dis.pop("state", None)
+        self.btn_manual.config(state="disabled", **_s_dis)
         self.log("🔄 [수동] 데이터 갱신 시작...")
 
         # 5-24-1. 별도의 일꾼을 써서 지금 바로 정보를 갱신합니다.
         def run_manual():
-            self.refresh_data(manual=True) 
+            self.refresh_data(manual=True)
             self.log("✅ [수동] 데이터 갱신 완료")
-            self.root.after(0, lambda: self.btn_manual.config(state="normal"))
+            def _re_enable():
+                self._btn_active['manual'] = True
+                _s_on = self.get_btn_style("normal")
+                _s_on.pop("state", None)
+                self.btn_manual.config(state="normal", **_s_on)
+            self.root.after(0, _re_enable)
 
         threading.Thread(target=run_manual, daemon=True).start()
 
