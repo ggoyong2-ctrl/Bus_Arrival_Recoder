@@ -36,13 +36,12 @@ else:
     FONT_SUB = "Apple SD Gothic Neo" 
     FONT_MONO = "Menlo"              
     # 3-2-1. 맥은 글자가 작게 보여서 1.4배 정도 키워줍니다.
-    # 3-2-1. macOS 버튼 크기가 Windows보다 크게 보이는 문제를 방지하기 위해
-    #        배율을 1.4→1.15 수준으로 낮춥니다.
-    SZ_L = 19
-    SZ_M = 11
-    SZ_S = 9
-    SZ_XS = 8
-    SZ_XXS = 7
+    #        버튼 크기 조정은 get_btn_style()의 padx/pady로 별도 제어합니다.
+    SZ_L = int(15 * 1.4)
+    SZ_M = int(11 * 1.4)
+    SZ_S = int(9 * 1.4)
+    SZ_XS = int(8 * 1.4)
+    SZ_XXS = int(7 * 1.4)
 
 # 4. [창고 검사] 프로그램을 돌릴 때 필요한 특수 도구들이 다 있는지 확인합니다.
 try:
@@ -73,7 +72,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.70") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.71") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -377,8 +376,18 @@ class SeoulBusArrivalRecorder:
         )
         self.btn_api_stats.pack(side="left", padx=(0, 4), fill="y")
 
-        self.api_stats_container = tk.Frame(right_r2, bg="#f1f2f6")
-        self.api_stats_container.pack(side="left", fill="y", anchor="center")
+        # API 통계 표를 right_r2 안에서 수직 중앙 정렬하기 위해
+        # outer wrapper를 fill="both"+expand=True 로 채우고,
+        # 내부 grid에서 빈 row(0, 2)에 weight=1 을 줘서 실제 표(row=1)가 가운데에 오도록 합니다.
+        stats_outer = tk.Frame(right_r2, bg="#f1f2f6")
+        stats_outer.pack(side="left", fill="both", expand=True)
+        stats_outer.grid_rowconfigure(0, weight=1)  # 위 여백 행
+        stats_outer.grid_rowconfigure(1, weight=0)  # 실제 표 행
+        stats_outer.grid_rowconfigure(2, weight=1)  # 아래 여백 행
+        stats_outer.grid_columnconfigure(0, weight=1)
+
+        self.api_stats_container = tk.Frame(stats_outer, bg="#f1f2f6")
+        self.api_stats_container.grid(row=1, column=0, sticky="")
         self.stat_value_labels = {}
         stat_layout = [
             ["ARR1", "ARR2", "SINF", "POS1", "POS2"],
