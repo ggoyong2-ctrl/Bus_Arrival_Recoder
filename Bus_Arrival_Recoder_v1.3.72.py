@@ -72,7 +72,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.71") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.72") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -1495,6 +1495,13 @@ class SeoulBusArrivalRecorder:
             self.log(f"ℹ ARR1 초과 → SINF 보조 호출 완료 (정류소 {idx+1}, {len(by_rid)}개 노선 수신)")
             return uid_cache
 
+        # ARR1 루프에서 운행종료로 판정된 노선 ID를 기록 → POS 루프에서 건너뜁니다.
+        # 판단 기준: arrmsg1/arrmsg2 가 모두 NO_BUS_MSGS 에 해당하는 경우
+        #   (차량번호가 응답에 포함되더라도 서울시 API 오류로 남아있는 경우가 있으므로
+        #    arrmsg 기준으로만 운행종료 여부를 판정합니다.)
+        NO_BUS_MSGS = {"운행정보없음", "운행종료", "출발대기", "-", ""}
+        arr_ended_rids = set()  # 이번 갱신에서 ARR1이 운행종료로 판정한 노선 집합
+
         # 노선마다 ARR1 우선 시도, 실패 시 SINF 캐시에서 해당 노선 항목만 추출
         for rid, rnm, _ in info.get('routes', []):
             row = None
@@ -1505,20 +1512,20 @@ class SeoulBusArrivalRecorder:
             root_arr = self.fetch_api("", arr_params, api_type="ARR1")
 
             if root_arr is not None and not isinstance(root_arr, tuple):
-                # 5-18-2-1-0. [노선 재출현] ARR1 응답에 실제 운행 버스가 있을 때만 POS 정지 해제
-                #   판단 기준 (둘 중 하나라도 해당하면 운행 중):
-                #     ① plainNo1/plainNo2 에 실제 차량번호(숫자+영문, "-"/"" 아님)가 존재
-                #     ② arrmsg1/arrmsg2 가 운행 없음 메시지("운행정보없음","운행종료","출발대기","-","") 이외의 값
-                #   → XML 응답 자체가 성공이더라도 차량 데이터 없으면 정지 유지
-                NO_BUS_MSGS = {"운행정보없음", "운행종료", "출발대기", "-", ""}
+                # 5-18-2-1-0. [운행 상태 판정] arrmsg 기준으로 실제 운행 여부를 판단합니다.
+                #   판단 기준 (arrmsg1/arrmsg2 둘 다 NO_BUS_MSGS → 운행종료):
+                #     ※ plainNo1/2에 차량번호가 있어도 서울시 API 오류로 남아있는 경우가 있어
+                #        arrmsg 값만을 운행종료 판정의 기준으로 사용합니다.
                 arr_items = root_arr.findall(".//itemList")
+                # 한 항목이라도 arrmsg1 또는 arrmsg2 가 NO_BUS_MSGS 밖의 값이면 운행 중
                 has_active_bus = any(
-                    (item.findtext("plainNo1") or "").strip() not in ("", "-")
-                    or (item.findtext("plainNo2") or "").strip() not in ("", "-")
-                    or (item.findtext("arrmsg1") or "").strip() not in NO_BUS_MSGS
+                    (item.findtext("arrmsg1") or "").strip() not in NO_BUS_MSGS
                     or (item.findtext("arrmsg2") or "").strip() not in NO_BUS_MSGS
                     for item in arr_items
                 )
+                # ARR1이 운행종료로 판정 → POS 루프에서 건너뛰도록 기록
+                if not has_active_bus:
+                    arr_ended_rids.add(rid)
                 if rid in self.pos_suspend_until:
                     if has_active_bus:
                         del self.pos_suspend_until[rid]
@@ -1596,6 +1603,12 @@ class SeoulBusArrivalRecorder:
 
             for rid, rnm, st_cnt in info.get('routes', []):
                 root_pos = None
+
+                # 5-18-3-1-0. [ARR1 운행종료 확인] ARR1에서 운행종료로 판정된 노선은 POS 호출 생략.
+                #   서울시 API 오류로 arrmsg="운행종료"임에도 차량번호가 응답에 남아있는 경우가 있어,
+                #   plainNo 대신 arrmsg 기준으로 판정한 결과를 사용합니다.
+                if rid in arr_ended_rids:
+                    continue
 
                 # 5-18-3-1-1. [POS 정지 확인] 첫차 시각 이전이면 호출 건너뜁니다.
                 now_dt = datetime.now()
