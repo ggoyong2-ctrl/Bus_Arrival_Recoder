@@ -72,7 +72,7 @@ class SeoulBusArrivalRecorder:
     def __init__(self, root):
         # 5-1-1. 화면의 기본 정보들을 설정합니다.
         self.root = root 
-        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.72") 
+        self.root.title("서울버스 정류소 듀얼 도착기록 프로그램 v1.3.79") 
         self.root.geometry("1200x800") 
         # 5-1-1-1. 창이 너무 작아지면 화면이 깨지므로 최소 크기를 정합니다.
         self.root.minsize(960, 400) 
@@ -108,7 +108,7 @@ class SeoulBusArrivalRecorder:
         if CURRENT_OS == "Windows":
             import ctypes
             try:
-                myappid = 'Bus_Arrival_Recoder(v1.3.49)' 
+                myappid = 'Bus_Arrival_Recoder(v1.3.79)' 
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             except: pass
 
@@ -138,7 +138,7 @@ class SeoulBusArrivalRecorder:
 
         # 5-1-8-2. 버스 정류소 정보와 감시 상태를 저장합니다.
         self.ars_ids = [tk.StringVar(), tk.StringVar()] # 정류소 번호 2개
-        self.refresh_interval_var = tk.StringVar(value="60") # 갱신 시간 (기본 60초)
+        self.refresh_interval_var = tk.StringVar(value="30") # 갱신 시간 (기본 30초)
         self.is_monitoring = False # 지금 감시 중인지 아닌지 (ON/OFF)
         
         # 5-1-8-3. 엑셀 저장 위치와 자동 저장 허용 여부입니다.
@@ -181,6 +181,17 @@ class SeoulBusArrivalRecorder:
         # 5-1-8-10. 자동 완결 파일 저장용: 이미 완결 파일을 저장한 영업일을 기억합니다.
         #   {"YYYY-MM-DD"} 형태의 집합으로 중복 저장을 방지합니다.
         self._completed_dates_saved = set()
+        # 5-1-8-11. [스레드 안전] 엑셀 파일 쓰기와 데이터 갱신의 동시 접근을 막는 잠금장치입니다.
+        #   _save_lock  : perform_auto_save() / _core_excel_save_logic() 를 한 스레드씩만 실행합니다.
+        #   _refresh_lock : refresh_data() 를 한 스레드씩만 실행합니다.
+        #   (자동 모니터링 스레드 + 수동 갱신 스레드가 동시에 실행될 때 발생하는
+        #    Race Condition 및 엑셀 스냅샷 역전으로 인한 데이터 누락을 방지합니다.)
+        self._save_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        # 5-1-8-12. [이중 저장 보호] 마지막으로 엑셀에 성공적으로 저장된 시점의 recorded_data 크기입니다.
+        #   refresh_data() 사이클 종료 시 현재 recorded_data 크기와 비교해
+        #   미저장 기록이 있으면 자동으로 재저장을 시도합니다 (구제 저장).
+        self._saved_record_count = 0
 
         # 5-1-9. API를 몇 번 호출했는지 세는 통계 숫자판입니다.
         # 5-1-9-1. 합산 통계(메인키 + 백업키 합계) — 메인 화면 상단에 표시됩니다.
@@ -189,6 +200,13 @@ class SeoulBusArrivalRecorder:
         }
         # 5-1-9-2. 메인/백업 키별 개별 통계 — API 상세 창에서 구분 표시됩니다.
         self.api_stats_by_key = {
+            "main": {k: 0 for k in self.api_stats},
+            "back": {k: 0 for k in self.api_stats},
+        }
+        # 5-1-9-3. [어제 스냅샷] 자정 초기화 직전의 통계값을 보관합니다.
+        #   통계 창 '어제의 합계' 탭에 표시됩니다.
+        self.api_stats_yesterday = {k: 0 for k in self.api_stats}
+        self.api_stats_by_key_yesterday = {
             "main": {k: 0 for k in self.api_stats},
             "back": {k: 0 for k in self.api_stats},
         }
@@ -208,166 +226,564 @@ class SeoulBusArrivalRecorder:
         }
         
         self.stats_win = None # 통계 창을 저장할 빈 공간
+        # 5-1-12. [다크모드] 현재 테마 상태 (False=라이트, True=다크)
+        self.is_dark_mode = False
 
         # 5-1-11. [최종 시작] 저장된 열쇠를 불러오고 화면을 그린 뒤 정보를 가져옵니다.
         self.load_saved_key() # 저장된 인증키가 있으면 불러옵니다.
-        self.setup_ui() 
+        self.setup_ui()
+        # 5-1-11-1. [X버튼 연결] 창 닫기(X) 클릭 시 종료 확인 팝업을 표시합니다.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        # 5-1-11-2. [자정 초기화 예약] 다음 0시 0분까지 남은 시간을 계산해 예약합니다.
+        #   ★ 핵심: _do_midnight_reset() 내부에서 이 함수를 다시 호출해야 매일 반복됩니다.
+        #     1회성 after() 만 등록하면 첫날만 작동하는 버그가 발생하므로 반드시 재예약합니다.
+        self.root.after(200, self._schedule_midnight_reset)
         self.root.after(500, self.start_excel_download_thread) 
 
     # 2그룹 : 메인 UI (Main UI)
 
+    # 5-1-A. [종료 확인] X버튼 클릭 시 정말 종료할지 확인하는 함수
+    def _on_window_close(self):
+        if messagebox.askyesno("종료 확인", "정말 종료하시겠습니까?"):
+            self.root.destroy()
+
+    # 5-1-B. [자정 예약] 다음 0시 0분 0초까지 남은 밀리초를 계산해 _do_midnight_reset을 예약합니다.
+    #   ★ 이 함수는 _do_midnight_reset() 내부에서도 재호출되어 매일 반복 실행이 보장됩니다.
+    def _schedule_midnight_reset(self):
+        now = datetime.now()
+        from datetime import timedelta
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        ms_left = int((next_midnight - now).total_seconds() * 1000)
+        ms_left = max(ms_left, 1000)  # 자정 직후 즉시 재귀 호출 방지
+        self.root.after(ms_left, self._do_midnight_reset)
+
+    # 5-1-C. [자정 초기화] 매일 0시 정각에 실행됩니다.
+    #   1) 오늘 통계 → 어제 스냅샷으로 복사
+    #   2) 오늘 카운터 0 초기화
+    #   3) UI 갱신 및 로그 기록
+    #   4) ★ 다음날 자정을 위해 _schedule_midnight_reset() 재호출 (없으면 첫날만 실행됨)
+    def _do_midnight_reset(self):
+        self.api_stats_yesterday = dict(self.api_stats)
+        self.api_stats_by_key_yesterday = {
+            slot: dict(vals) for slot, vals in self.api_stats_by_key.items()
+        }
+        for k in self.api_stats:
+            self.api_stats[k] = 0
+        for slot in self.api_stats_by_key.values():
+            for k in slot:
+                slot[k] = 0
+        self.update_api_counter_ui()
+        self.log("📅 [자정] API 호출 카운터를 초기화했습니다. 어제의 합계는 통계 창에서 확인할 수 있습니다.")
+        # ★ 반드시 재예약해야 매일 반복됩니다.
+        self._schedule_midnight_reset()
+
+
+    # 5-1-D. [테마 색상] 라이트/다크 팔레트를 딕셔너리로 반환합니다.
+    def get_theme(self):
+        if self.is_dark_mode:
+            return {
+                "bg_root":      "#0f0f0f",
+                "bg_panel":     "#212121",
+                "bg_card":      "#272727",
+                "bg_entry":     "#121212",
+                "bg_entry_ro":  "#1a1a1a",
+                "fg_main":      "#f1f1f1",
+                "fg_sub":       "#aaaaaa",
+                "fg_accent":    "#3ea6ff",
+                "fg_warn":      "#ff4e45",
+                "fg_link":      "#5ebe5e",
+                "fg_email":     "#3ea6ff",
+                "fg_st1":       "#3ea6ff",
+                "fg_st2":       "#ff4e45",
+                "fg_counter":   "#aaaaaa",
+                "fg_counter_v": "#f1f1f1",
+                "bg_log":       "#0f0f0f",
+                "fg_log":       "#dfe6e9",
+                "bg_tree":      "#212121",
+                "fg_tree":      "#f1f1f1",
+                "bg_tree_sel":  "#3f3f3f",
+                "border":       "#3f3f3f",
+                "sash":         "#3f3f3f",
+                "btn_normal_bg":      "#272727",
+                "btn_normal_fg":      "#f1f1f1",
+                "btn_normal_active":  "#3f3f3f",
+                "btn_normal_border":  "#3f3f3f",
+                "btn_outline_bg":     "#272727",
+                "btn_outline_fg":     "#3ea6ff",
+                "btn_outline_border": "#3ea6ff",
+                "btn_disabled_bg":    "#1a1a1a",
+                "btn_disabled_fg":    "#555555",
+                "btn_disabled_border":"#2a2a2a",
+                "toggle_track_off":  "#3f3f3f",
+                "toggle_track_on":   "#3ea6ff",
+                "toggle_thumb":      "#f1f1f1",
+                "toggle_label":      "#aaaaaa",
+                "toggle_bg":         "#272727",
+                # 스크롤바
+                "sb_bg":      "#3f3f3f",   # 스크롤바 thumb 배경
+                "sb_trough":  "#1a1a1a",   # 스크롤바 trough(홈) 배경
+                "sb_arrow":   "#aaaaaa",   # 스크롤바 화살표 색
+            }
+        else:
+            return {
+                "bg_root":      "#ffffff",
+                "bg_panel":     "#ecf0f1",
+                "bg_card":      "#f1f2f6",
+                "bg_entry":     "#ffffff",
+                "bg_entry_ro":  "#f0f0f0",
+                "fg_main":      "#2d3436",
+                "fg_sub":       "#7f8c8d",
+                "fg_accent":    "#0984e3",
+                "fg_warn":      "#e74c3c",
+                "fg_link":      "#006400",
+                "fg_email":     "#2980b9",
+                "fg_st1":       "#0984e3",
+                "fg_st2":       "#d63031",
+                "fg_counter":   "#636e72",
+                "fg_counter_v": "#2d3436",
+                "bg_log":       "#2d3436",
+                "fg_log":       "#dfe6e9",
+                "bg_tree":      "#ffffff",
+                "fg_tree":      "#000000",
+                "bg_tree_sel":  "#0078d7",
+                "border":       "#cccccc",
+                "sash":         "#cccccc",
+                "btn_normal_bg":      "#2ecc71",
+                "btn_normal_fg":      "#ffffff",
+                "btn_normal_active":  "#27ae60",
+                "btn_normal_border":  "#1e8449",
+                "btn_outline_bg":     "#eafaf1",
+                "btn_outline_fg":     "#27ae60",
+                "btn_outline_border": "#27ae60",
+                "btn_disabled_bg":    "#e8e8e8",
+                "btn_disabled_fg":    "#a0a0a0",
+                "btn_disabled_border":"#c0c0c0",
+                "toggle_track_off":  "#bbbbbb",
+                "toggle_track_on":   "#2ecc71",
+                "toggle_thumb":      "#ffffff",
+                "toggle_label":      "#7f8c8d",
+                "toggle_bg":         "#f1f2f6",
+                # 스크롤바
+                "sb_bg":      "#c0c0c0",
+                "sb_trough":  "#f0f0f0",
+                "sb_arrow":   "#606060",
+            }
+
+    # 5-1-E. [테마 적용] is_dark_mode에 맞게 전체 위젯 색상을 갱신합니다.
+    def apply_theme(self):
+        T = self.get_theme()
+        self.root.configure(bg=T["bg_root"])
+        self.top_container.configure(bg=T["bg_panel"])
+
+        for w in self._tw.get("status_frames", []):
+            try: w.configure(bg=T["bg_panel"])
+            except: pass
+        for key, w in self._tw.get("status_labels", {}).items():
+            try:
+                if key == "title_text":  w.configure(bg=T["bg_panel"], fg=T["fg_main"])
+                elif key == "title_text3":  w.configure(bg=T["bg_panel"], fg=T["fg_main"])
+                elif key == "title_blue":w.configure(bg=T["bg_panel"], fg=T["fg_accent"])
+                elif key == "maker":     w.configure(bg=T["bg_panel"], fg=T["fg_sub"])
+                elif key == "email":     w.configure(bg=T["bg_panel"], fg=T["fg_email"])
+                elif key == "link1":     w.configure(bg=T["bg_panel"], fg=T["fg_link"])
+                elif key == "link2":     w.configure(bg=T["bg_panel"], fg="#7fb3ff" if self.is_dark_mode else "#000080")
+                elif key == "maker_bracket1": w.configure(bg=T["bg_panel"], fg=T["fg_sub"])
+                elif key == "maker_bracket2": w.configure(bg=T["bg_panel"], fg=T["fg_sub"])
+            except: pass
+
+        for w in self._tw.get("ctrl_frames", []):
+            try: w.configure(bg=T["bg_card"])
+            except: pass
+        try: self.lbl_auto_save_status.configure(bg=T["bg_card"], fg=T["fg_warn"])
+        except: pass
+        for w in self._tw.get("interval_labels", []):
+            try: w.configure(bg=T["bg_card"], fg=T["fg_main"])
+            except: pass
+        try:
+            self.entry_refresh_interval.configure(
+                bg=T["bg_entry"], fg=T["fg_main"],
+                insertbackground=T["fg_main"],
+                readonlybackground=T["bg_entry_ro"])
+        except: pass
+        for entry in [self.entry_service_key, self.entry_backup_key]:
+            try:
+                entry.configure(
+                    bg=T["bg_entry"], fg=T["fg_main"],
+                    insertbackground=T["fg_main"],
+                    readonlybackground=T["bg_entry_ro"])
+            except: pass
+        for w in self._tw.get("key_labels", []):
+            try: w.configure(bg=T["bg_card"], fg=T["fg_main"])
+            except: pass
+        for w in self._tw.get("key_frames", []):
+            try: w.configure(bg=T["bg_card"])
+            except: pass
+
+        try: self.api_stats_container.configure(bg=T["bg_card"])
+        except: pass
+        try: self._tw["stats_outer"].configure(bg=T["bg_card"])
+        except: pass
+        for lbl in self._tw.get("stat_key_labels", []):
+            try: lbl.configure(bg=T["bg_card"], fg=T["fg_counter"])
+            except: pass
+        for key, lbl in self.stat_value_labels.items():
+            try: lbl.configure(bg=T["bg_card"], fg=T["fg_counter_v"])
+            except: pass
+
+        self._restyle_all_buttons(T)
+
+        for pw in [self.super_paned, self.main_paned]:
+            try: pw.configure(bg=T["sash"])
+            except: pass
+
+        for w in self._tw.get("tree_frames", []):
+            try: w.configure(bg=T["bg_root"])
+            except: pass
+
+        for lbl in self.lbl_st_names:
+            try: lbl.configure(fg=T["fg_st1"], bg=T["bg_root"])
+            except: pass
+        for lbl in self.lbl_hist_titles:
+            try: lbl.configure(fg=T["fg_st2"], bg=T["bg_root"])
+            except: pass
+        for w in self._tw.get("ars_entries", []):
+            try: w.configure(readonlybackground=T["bg_entry_ro"], fg=T["fg_main"])
+            except: pass
+
+        try:
+            self.txt_log.configure(bg=T["bg_log"], fg=T["fg_log"])
+            self._tw["log_outer"].configure(bg=T["bg_root"])
+        except: pass
+
+        self._apply_treeview_style(T)
+        self._apply_scrollbar_style(T)
+        self._draw_toggle()
+
+    # 5-1-F. [버튼 일괄 재스타일]
+    def _restyle_all_buttons(self, T):
+        for btn, type_cell in self._tw.get("buttons", []):
+            try:
+                style = self.get_btn_style(type_cell[0])
+                style.pop("state", None)
+                btn.configure(**style)
+            except: pass
+
+    # 5-1-G. [Treeview 테마]
+    def _apply_treeview_style(self, T):
+        sty = ttk.Style()
+        if self.is_dark_mode:
+            sty.configure("Treeview",
+                background=T["bg_tree"], foreground=T["fg_tree"],
+                fieldbackground=T["bg_tree"], rowheight=22)
+            sty.configure("Treeview.Heading",
+                background=T["bg_card"], foreground=T["fg_main"], relief="flat")
+            sty.map("Treeview",
+                background=[("selected", T["bg_tree_sel"])],
+                foreground=[("selected", T["fg_main"])])
+            sty.map("Treeview.Heading",
+                background=[("active", T["border"])])
+        else:
+            sty.configure("Treeview",
+                background="#ffffff", foreground="#000000",
+                fieldbackground="#ffffff", rowheight=22)
+            sty.configure("Treeview.Heading",
+                background="#f0f0f0", foreground="#000000", relief="raised")
+            sty.map("Treeview",
+                background=[("selected", "#0078d7")],
+                foreground=[("selected", "#ffffff")])
+            sty.map("Treeview.Heading",
+                background=[("active", "#e0e0e0")])
+
+    # 5-1-G2. [스크롤바 테마] 앱 전체 ttk.Scrollbar 색상을 테마에 맞게 적용합니다.
+    #   - "App.Vertical.TScrollbar" 스타일로 모든 scrollbar에 일괄 적용합니다.
+    #   - macOS Aqua 테마에서는 troughcolor/background 적용이 제한적이나
+    #     arrowcolor는 반영되며 시각적 차이를 제공합니다.
+    def _apply_scrollbar_style(self, T):
+        sty = ttk.Style()
+        sty.configure("App.Vertical.TScrollbar",
+            background=T["sb_bg"],
+            troughcolor=T["sb_trough"],
+            arrowcolor=T["sb_arrow"],
+            bordercolor=T["sb_trough"],
+            darkcolor=T["sb_bg"],
+            lightcolor=T["sb_bg"],
+            relief="flat",
+        )
+        sty.map("App.Vertical.TScrollbar",
+            background=[
+                ("active",   T["border"]),
+                ("disabled", T["sb_trough"]),
+            ])
+
+
+    def _build_toggle(self, parent):
+        T = self.get_theme()
+        # 폰트 크기(SZ_XS)에 맞춘 소형 토글: 트랙 28×14, 썸 반지름 5
+        TRACK_W, TRACK_H, THUMB_R = 28, 14, 5
+        # ① 문구 먼저 (왼쪽)
+        self._toggle_label = tk.Label(
+            parent, text="다크", font=(FONT_MAIN, SZ_XS),
+            fg=T["toggle_label"], bg=T["bg_panel"],
+            cursor="pointinghand" if CURRENT_OS == "Darwin" else "hand2"
+        )
+        self._toggle_label.pack(side="left", padx=(6, 2))
+        self._toggle_label.bind("<Button-1>", self._on_toggle_theme)
+        # ② 스위치 나중에 (오른쪽)
+        self._toggle_canvas = tk.Canvas(
+            parent, width=TRACK_W + 6, height=TRACK_H + 6,
+            highlightthickness=0,
+            cursor="pointinghand" if CURRENT_OS == "Darwin" else "hand2"
+        )
+        self._toggle_canvas.pack(side="left", padx=(0, 6))
+        self._toggle_canvas.bind("<Button-1>", self._on_toggle_theme)
+        self._draw_toggle()
+
+    # 5-1-I. [토글 스위치 그리기] — 소형 (28×14, 썸 반지름 5)
+    def _draw_toggle(self):
+        if not hasattr(self, "_toggle_canvas"):
+            return
+        T = self.get_theme()
+        c = self._toggle_canvas
+        TRACK_W, TRACK_H, THUMB_R = 28, 14, 5
+        ox, oy = 3, 3
+        c.delete("all")
+        parent_bg = T["bg_panel"]
+        c.configure(bg=parent_bg)
+        track_color = T["toggle_track_on"] if self.is_dark_mode else T["toggle_track_off"]
+        r = TRACK_H // 2
+        # 둥근 트랙
+        c.create_arc(ox, oy, ox+TRACK_H, oy+TRACK_H, start=90, extent=180,
+                     fill=track_color, outline=track_color)
+        c.create_arc(ox+TRACK_W-TRACK_H, oy, ox+TRACK_W, oy+TRACK_H, start=270, extent=180,
+                     fill=track_color, outline=track_color)
+        c.create_rectangle(ox+r, oy, ox+TRACK_W-r, oy+TRACK_H,
+                           fill=track_color, outline=track_color)
+        # 썸(원): 다크=오른쪽, 라이트=왼쪽
+        thumb_cx = (ox+TRACK_W-THUMB_R-3) if self.is_dark_mode else (ox+THUMB_R+3)
+        thumb_cy = oy + TRACK_H // 2
+        c.create_oval(thumb_cx-THUMB_R, thumb_cy-THUMB_R,
+                      thumb_cx+THUMB_R, thumb_cy+THUMB_R,
+                      fill=T["toggle_thumb"], outline=T["toggle_thumb"])
+        # 레이블 업데이트
+        try:
+            self._toggle_label.configure(
+                text="라이트" if self.is_dark_mode else "다크",
+                fg=T["toggle_label"], bg=parent_bg)
+        except: pass
+
+    # 5-1-J. [토글 클릭]
+    def _on_toggle_theme(self, event=None):
+        self.is_dark_mode = not self.is_dark_mode
+        self.apply_theme()
+
+    # 5-2. [그림 그리기] 화면의 전체적인 레이아웃과 버튼들을 배치하는 함수
     # 5-2. [그림 그리기] 화면의 전체적인 레이아웃과 버튼들을 배치하는 함수
     def setup_ui(self):
+        # 5-2-0. 위젯 추적 딕셔너리 초기화 (apply_theme 에서 재색상 적용에 사용합니다)
+        self._tw = {
+            "status_frames": [], "status_labels": {}, "ctrl_frames": [],
+            "interval_labels": [], "key_labels": [], "key_frames": [],
+            "stat_key_labels": [], "tree_frames": [], "ars_entries": [],
+            "buttons": [],
+        }
+
         # 5-2-1. 맥 컴퓨터라면 글자색을 약간 조절합니다.
-        mac_lbl_opts = {"fg": "#2d3436"} if CURRENT_OS == "Darwin" else {}
+        T = self.get_theme()
 
         # 5-2-2. 화면 제일 상단에 프로그램 안내 문구를 넣습니다.
-        frame_status = tk.Frame(self.top_container, pady=2, bg="#ecf0f1")
+        frame_status = tk.Frame(self.top_container, pady=2, bg=T["bg_panel"])
         frame_status.pack(fill="x", side="top")
-        
-        # 5-2-2-1. 왼쪽 영역 안내 글씨들
-        frame_left_status = tk.Frame(frame_status, bg="#ecf0f1")
-        frame_left_status.pack(side="left", padx=10, pady=2)
-        self.lbl_info_container = tk.Frame(frame_left_status, bg="#ecf0f1")
-        self.lbl_info_container.pack(anchor="w", pady=(2, 0))
+        self._tw["status_frames"].append(frame_status)
 
-        tk.Label(self.lbl_info_container, text="정류소와 노선을 선택하고 ", font=(FONT_MAIN, SZ_L, "bold"), fg="#2d3436", bg="#ecf0f1").pack(side="left")
-        tk.Label(self.lbl_info_container, text="자동 기록 시작", font=(FONT_MAIN, SZ_L, "bold"), fg="#0984e3", bg="#ecf0f1").pack(side="left")
-        tk.Label(self.lbl_info_container, text=" 버튼을 누르세요.", font=(FONT_MAIN, SZ_L, "bold"), fg="#2d3436", bg="#ecf0f1").pack(side="left")
-        
-        # 5-2-2-2. 오른쪽 영역 제작자 정보 및 사이트 링크들
-        frame_right_status = tk.Frame(frame_status, bg="#ecf0f1")
+        # 5-2-2-1. 왼쪽 영역 안내 글씨들
+        frame_left_status = tk.Frame(frame_status, bg=T["bg_panel"])
+        frame_left_status.pack(side="left", padx=10, pady=2)
+        self._tw["status_frames"].append(frame_left_status)
+        self.lbl_info_container = tk.Frame(frame_left_status, bg=T["bg_panel"])
+        self.lbl_info_container.pack(anchor="w", pady=(2, 0))
+        self._tw["status_frames"].append(self.lbl_info_container)
+
+        lbl_t1 = tk.Label(self.lbl_info_container, text="정류소와 노선을 선택하고 ",
+                          font=(FONT_MAIN, SZ_L, "bold"), fg=T["fg_main"], bg=T["bg_panel"])
+        lbl_t1.pack(side="left")
+        self._tw["status_labels"]["title_text"] = lbl_t1
+        lbl_t2 = tk.Label(self.lbl_info_container, text="자동 기록 시작",
+                          font=(FONT_MAIN, SZ_L, "bold"), fg=T["fg_accent"], bg=T["bg_panel"])
+        lbl_t2.pack(side="left")
+        self._tw["status_labels"]["title_blue"] = lbl_t2
+        lbl_t3 = tk.Label(self.lbl_info_container, text=" 버튼을 누르세요.",
+                          font=(FONT_MAIN, SZ_L, "bold"), fg=T["fg_main"], bg=T["bg_panel"])
+        lbl_t3.pack(side="left")
+        # title_text 를 리스트로 관리: t3도 같이 처리
+        self._tw["status_labels"]["title_text3"] = lbl_t3
+
+        # 5-2-2-2. 오른쪽 영역: 제작자 정보 + 링크 (토글은 박국환 행 우측에 배치)
+        frame_right_status = tk.Frame(frame_status, bg=T["bg_panel"])
         frame_right_status.pack(side="right", padx=10, pady=2)
-        frame_right_top = tk.Frame(frame_right_status, bg="#ecf0f1")
+        self._tw["status_frames"].append(frame_right_status)
+
+        # 제작자 정보 행: ① 토글뭉치(문구+스위치)  ②  [만든이 : 박국환 (이메일)]
+        frame_right_top = tk.Frame(frame_right_status, bg=T["bg_panel"])
         frame_right_top.pack(side="top", anchor="e")
-        tk.Label(frame_right_top, text=" [ 만든이 : 박 국 환 (", font=(FONT_SUB, SZ_XS), fg="#7f8c8d", bg="#ecf0f1").pack(side="left", padx=(5, 0))
-        lbl_email = tk.Label(frame_right_top, text="ggoyong2@naver.com", font=(FONT_SUB, SZ_XS, "underline"), fg="#2980b9", bg="#ecf0f1", cursor="hand2")
-        lbl_email.pack(side="left"); lbl_email.bind("<Button-1>", lambda e: self.send_email_link("ggoyong2@naver.com"))
-        tk.Label(frame_right_top, text=") ]", font=(FONT_SUB, SZ_XS), fg="#7f8c8d", bg="#ecf0f1").pack(side="left")
-        
-        frame_sources = tk.Frame(frame_right_status, bg="#ecf0f1")
+        self._tw["status_frames"].append(frame_right_top)
+
+        # ── ① 토글 뭉치 (왼쪽) ─────────────────────────────────────────
+        self._build_toggle(frame_right_top)
+
+        # ── ② 제작자 문구 (오른쪽) ──────────────────────────────────────
+        lbl_m1 = tk.Label(frame_right_top, text=" [ 만든이 : 박 국 환 (",
+                           font=(FONT_SUB, SZ_XS), fg=T["fg_sub"], bg=T["bg_panel"])
+        lbl_m1.pack(side="left", padx=(5, 0))
+        self._tw["status_labels"]["maker_bracket1"] = lbl_m1
+        lbl_email = tk.Label(frame_right_top, text="ggoyong2@naver.com",
+                             font=(FONT_SUB, SZ_XS, "underline"), fg=T["fg_email"],
+                             bg=T["bg_panel"], cursor="hand2")
+        lbl_email.pack(side="left")
+        lbl_email.bind("<Button-1>", lambda e: self.send_email_link("ggoyong2@naver.com"))
+        self._tw["status_labels"]["email"] = lbl_email
+        lbl_m2 = tk.Label(frame_right_top, text=") ]",
+                           font=(FONT_SUB, SZ_XS), fg=T["fg_sub"], bg=T["bg_panel"])
+        lbl_m2.pack(side="left")
+        self._tw["status_labels"]["maker_bracket2"] = lbl_m2
+
+        frame_sources = tk.Frame(frame_right_status, bg=T["bg_panel"])
         frame_sources.pack(side="top", anchor="e")
-        lbl_link1 = tk.Label(frame_sources, text="공공데이터포털 Open API (https://www.data.go.kr)", font=(FONT_SUB, SZ_XS), fg="#006400", bg="#ecf0f1", cursor="hand2")
-        lbl_link1.pack(side="top", anchor="e"); lbl_link1.bind("<Button-1>", lambda e: self.open_link("https://www.data.go.kr"))
-        lbl_link2 = tk.Label(frame_sources, text="서울시 버스운행노선 정보 (https://data.seoul.go.kr)", font=(FONT_SUB, SZ_XS), fg="#000080", bg="#ecf0f1", cursor="hand2")
-        lbl_link2.pack(side="top", anchor="e"); lbl_link2.bind("<Button-1>", lambda e: self.open_link("https://data.seoul.go.kr/dataList/OA-15066/F/1/datasetView.do"))
+        self._tw["status_frames"].append(frame_sources)
+        lbl_link1 = tk.Label(frame_sources,
+                             text="공공데이터포털 Open API (https://www.data.go.kr)",
+                             font=(FONT_SUB, SZ_XS), fg=T["fg_link"], bg=T["bg_panel"], cursor="hand2")
+        lbl_link1.pack(side="top", anchor="e")
+        lbl_link1.bind("<Button-1>", lambda e: self.open_link("https://www.data.go.kr"))
+        self._tw["status_labels"]["link1"] = lbl_link1
+        lbl_link2 = tk.Label(frame_sources,
+                             text="서울시 버스운행노선 정보 (https://data.seoul.go.kr)",
+                             font=(FONT_SUB, SZ_XS), fg="#000080", bg=T["bg_panel"], cursor="hand2")
+        lbl_link2.pack(side="top", anchor="e")
+        lbl_link2.bind("<Button-1>", lambda e: self.open_link("https://data.seoul.go.kr/dataList/OA-15066/F/1/datasetView.do"))
+        self._tw["status_labels"]["link2"] = lbl_link2
 
         # 5-2-3. 주요 조종 버튼들이 모여있는 패널을 만듭니다.
-        self.frame_ctrl_master = tk.Frame(self.top_container, pady=4, bg="#f1f2f6")
+        self.frame_ctrl_master = tk.Frame(self.top_container, pady=4, bg=T["bg_card"])
         self.frame_ctrl_master.pack(fill="x", side="top")
+        self._tw["ctrl_frames"].append(self.frame_ctrl_master)
 
-        frame_main_content = tk.Frame(self.frame_ctrl_master, bg="#f1f2f6")
+        frame_main_content = tk.Frame(self.frame_ctrl_master, bg=T["bg_card"])
         frame_main_content.pack(side="left", fill="x", expand=True)
+        self._tw["ctrl_frames"].append(frame_main_content)
 
-        PAD = 5  # 버튼·위젯 사이 공통 간격
+        PAD = 5
 
         # ══════════════════════════════════════════════════════════════════
         # 1행: 좌=자동저장 안내문구  /  우=(갱신주기 + 자동기록시작 + 수동갱신 + 다른이름저장)
         # ══════════════════════════════════════════════════════════════════
-        frame_row1 = tk.Frame(frame_main_content, bg="#f1f2f6")
+        frame_row1 = tk.Frame(frame_main_content, bg=T["bg_card"])
         frame_row1.pack(fill="x", side="top", pady=(2, 1))
+        self._tw["ctrl_frames"].append(frame_row1)
 
-        # 1행 좌측: 자동 저장 안내 문구
         self.lbl_auto_save_status = tk.Label(
             frame_row1,
-            text="자동 기록 시작 버튼을 작동시키면 도착 기록이 엑셀파일로 자동 저장됩니다.",
-            font=(FONT_SUB, SZ_XS, "bold"), fg="#e74c3c", bg="#f1f2f6"
+            text=" ※ 자동 기록 시작 버튼을 작동시키면 도착 기록이 엑셀파일로 자동 저장됩니다.",
+            font=(FONT_SUB, SZ_XS, "bold"), fg=T["fg_warn"], bg=T["bg_card"]
         )
         self.lbl_auto_save_status.pack(side="left", padx=(5, 0))
 
-        # 1행 우측 그룹: 갱신주기 | 자동기록시작 | 수동갱신 | 다른이름으로엑셀저장
-        right_r1 = tk.Frame(frame_row1, bg="#f1f2f6")
+        right_r1 = tk.Frame(frame_row1, bg=T["bg_card"])
         right_r1.pack(side="right", padx=(0, 5))
+        self._tw["ctrl_frames"].append(right_r1)
 
-        # 갱신주기 레이블 + 입력칸 (가장 왼쪽)
-        tk.Label(
-            right_r1, text="갱신주기(초):", bg="#f1f2f6",
-            font=(FONT_MAIN, SZ_S, "bold"), **mac_lbl_opts
-        ).pack(side="left", padx=(PAD * 2, 2))
-        entry_ival_opts = {
-            "bg": "white", "fg": "black", "insertbackground": "black",
-            "font": (FONT_MONO, SZ_S), "readonlybackground": "#f0f0f0"
-        }
+        lbl_ival = tk.Label(right_r1, text="갱신주기(초):", bg=T["bg_card"],
+                            font=(FONT_MAIN, SZ_S, "bold"), fg=T["fg_main"])
+        lbl_ival.pack(side="left", padx=(PAD * 2, 2))
+        self._tw["interval_labels"].append(lbl_ival)
+
         self.entry_refresh_interval = tk.Entry(
             right_r1, textvariable=self.refresh_interval_var,
-            width=4, **entry_ival_opts
+            width=4, bg=T["bg_entry"], fg=T["fg_main"],
+            insertbackground=T["fg_main"], font=(FONT_MONO, SZ_S),
+            readonlybackground=T["bg_entry_ro"]
         )
         self.entry_refresh_interval.pack(side="left", padx=(0, PAD))
 
-        # 자동 기록 시작/중지 토글
-        # BTN_H: 이 행의 기준 높이(픽셀)입니다. btn_save_excel의 작은 폰트가
-        #        버튼을 축소시키지 않도록 모든 버튼에 동일한 height를 지정합니다.
-        BTN_H = 1  # tk.Button height 단위(줄 수). 1줄 고정으로 높이를 통일합니다.
+        BTN_H = 1
         self.btn_toggle = tk.Button(
             right_r1, text="자동 기록 시작",
             command=self._on_toggle_monitoring, width=11, height=BTN_H,
             **self.get_btn_style("normal")
         )
         self.btn_toggle.pack(side="left", padx=(0, PAD), ipady=4)
+        self._tw["buttons"].append((self.btn_toggle, ["normal"]))
 
-        # 수동 갱신
         self.btn_manual = tk.Button(
             right_r1, text="수동 갱신",
             command=self.manual_refresh, width=7, height=BTN_H,
             **self.get_btn_style("normal")
         )
         self.btn_manual.pack(side="left", padx=(0, PAD), ipady=4)
+        self._tw["buttons"].append((self.btn_manual, ["normal"]))
 
-        # 다른 이름으로 엑셀 저장 — 1줄, 상단 버튼들과 동일한 폰트·높이
         self.btn_save_excel = tk.Button(
             right_r1, text="다른 이름으로 엑셀 저장",
             command=self.save_to_excel, height=BTN_H,
             **self.get_btn_style("normal")
         )
         self.btn_save_excel.pack(side="left", padx=(0, 8), ipady=4)
+        self._tw["buttons"].append((self.btn_save_excel, ["normal"]))
 
         # ══════════════════════════════════════════════════════════════════
-        # 2행: 좌=(인증키 입력창 + 인증키버튼)  /  우=(API현황버튼 + API카운트표)
+        # 2행: 좌=(인증키 입력창 + 버튼)  /  우=(API현황 버튼 + API카운트표)
         # ══════════════════════════════════════════════════════════════════
-        frame_row2 = tk.Frame(frame_main_content, bg="#f1f2f6")
+        frame_row2 = tk.Frame(frame_main_content, bg=T["bg_card"])
         frame_row2.pack(fill="x", side="top", pady=(1, 2))
+        self._tw["ctrl_frames"].append(frame_row2)
 
-        # 2행 좌측: 인증키 입력 영역 + 인증키 버튼
-        left_r2 = tk.Frame(frame_row2, bg="#f1f2f6")
+        left_r2 = tk.Frame(frame_row2, bg=T["bg_card"])
         left_r2.pack(side="left", padx=(5, 0), fill="y")
+        self._tw["key_frames"].append(left_r2)
 
-        entry_key_opts = {
-            "show": "*", "bg": "white", "fg": "black",
-            "insertbackground": "black", "font": (FONT_MONO, SZ_XXS),
-            "readonlybackground": "#f0f0f0"
-        }
-        key_input_area = tk.Frame(left_r2, bg="#f1f2f6")
+        key_input_area = tk.Frame(left_r2, bg=T["bg_card"])
         key_input_area.pack(side="left", fill="y")
+        self._tw["key_frames"].append(key_input_area)
 
-        main_key_row = tk.Frame(key_input_area, bg="#f1f2f6")
+        main_key_row = tk.Frame(key_input_area, bg=T["bg_card"])
         main_key_row.pack(fill="x", pady=1)
-        tk.Label(main_key_row, text="메인인증키 :", font=(FONT_MAIN, SZ_S),
-                 bg="#f1f2f6", **mac_lbl_opts).pack(side="left")
+        self._tw["key_frames"].append(main_key_row)
+        lbl_mk = tk.Label(main_key_row, text="메인인증키 :", font=(FONT_MAIN, SZ_S),
+                          bg=T["bg_card"], fg=T["fg_main"])
+        lbl_mk.pack(side="left")
+        self._tw["key_labels"].append(lbl_mk)
         self.entry_service_key = tk.Entry(
             main_key_row, textvariable=self.service_key_var,
-            width=68, **entry_key_opts)
+            width=68, show="*", bg=T["bg_entry"], fg=T["fg_main"],
+            insertbackground=T["fg_main"], font=(FONT_MONO, SZ_XXS),
+            readonlybackground=T["bg_entry_ro"])
         self.entry_service_key.pack(side="left", padx=2)
 
-        backup_key_row = tk.Frame(key_input_area, bg="#f1f2f6")
+        backup_key_row = tk.Frame(key_input_area, bg=T["bg_card"])
         backup_key_row.pack(fill="x", pady=1)
-        tk.Label(backup_key_row, text="백업인증키 :", font=(FONT_MAIN, SZ_S),
-                 bg="#f1f2f6", **mac_lbl_opts).pack(side="left")
+        self._tw["key_frames"].append(backup_key_row)
+        lbl_bk = tk.Label(backup_key_row, text="백업인증키 :", font=(FONT_MAIN, SZ_S),
+                          bg=T["bg_card"], fg=T["fg_main"])
+        lbl_bk.pack(side="left")
+        self._tw["key_labels"].append(lbl_bk)
         self.entry_backup_key = tk.Entry(
             backup_key_row, textvariable=self.backup_key_var,
-            width=68, **entry_key_opts)
+            width=68, show="*", bg=T["bg_entry"], fg=T["fg_main"],
+            insertbackground=T["fg_main"], font=(FONT_MONO, SZ_XXS),
+            readonlybackground=T["bg_entry_ro"])
         self.entry_backup_key.pack(side="left", padx=2)
 
-        # 인증키 확인/잠금 버튼 — "인증키 입력": normal(녹색) / "인증키 변경": outline(테두리)
         self.btn_key_manage = tk.Button(
             left_r2, text="인증키\n입력",
             command=self.toggle_key_lock, width=7,
             **self.get_btn_style("normal")
         )
         self.btn_key_manage.pack(side="left", padx=(6, 0), fill="y")
+        self._tw["buttons"].append((self.btn_key_manage, ["normal"]))
 
-        # 2행 우측: API 호출 현황 버튼 + 통계 숫자판
-        right_r2 = tk.Frame(frame_row2, bg="#f1f2f6")
+        right_r2 = tk.Frame(frame_row2, bg=T["bg_card"])
         right_r2.pack(side="right", padx=(0, 5), fill="y")
+        self._tw["ctrl_frames"].append(right_r2)
 
         self.btn_api_stats = tk.Button(
             right_r2, text="API\n호출 현황",
@@ -375,18 +791,17 @@ class SeoulBusArrivalRecorder:
             width=7, **self.get_btn_style("normal")
         )
         self.btn_api_stats.pack(side="left", padx=(0, 4), fill="y")
+        self._tw["buttons"].append((self.btn_api_stats, ["normal"]))
 
-        # API 통계 표를 right_r2 안에서 수직 중앙 정렬하기 위해
-        # outer wrapper를 fill="both"+expand=True 로 채우고,
-        # 내부 grid에서 빈 row(0, 2)에 weight=1 을 줘서 실제 표(row=1)가 가운데에 오도록 합니다.
-        stats_outer = tk.Frame(right_r2, bg="#f1f2f6")
+        stats_outer = tk.Frame(right_r2, bg=T["bg_card"])
         stats_outer.pack(side="left", fill="both", expand=True)
-        stats_outer.grid_rowconfigure(0, weight=1)  # 위 여백 행
-        stats_outer.grid_rowconfigure(1, weight=0)  # 실제 표 행
-        stats_outer.grid_rowconfigure(2, weight=1)  # 아래 여백 행
+        stats_outer.grid_rowconfigure(0, weight=1)
+        stats_outer.grid_rowconfigure(1, weight=0)
+        stats_outer.grid_rowconfigure(2, weight=1)
         stats_outer.grid_columnconfigure(0, weight=1)
+        self._tw["stats_outer"] = stats_outer
 
-        self.api_stats_container = tk.Frame(stats_outer, bg="#f1f2f6")
+        self.api_stats_container = tk.Frame(stats_outer, bg=T["bg_card"])
         self.api_stats_container.grid(row=1, column=0, sticky="")
         self.stat_value_labels = {}
         stat_layout = [
@@ -395,15 +810,17 @@ class SeoulBusArrivalRecorder:
         ]
         for r, row_keys in enumerate(stat_layout):
             for c, key in enumerate(row_keys):
-                tk.Label(
+                lbl_key = tk.Label(
                     self.api_stats_container,
                     text=key, font=(FONT_MONO, SZ_XS, "bold"),
-                    fg="#636e72", bg="#f1f2f6", width=5, anchor="w"
-                ).grid(row=r, column=c*2, padx=(6, 0), sticky="w")
+                    fg=T["fg_counter"], bg=T["bg_card"], width=5, anchor="w"
+                )
+                lbl_key.grid(row=r, column=c*2, padx=(6, 0), sticky="w")
+                self._tw["stat_key_labels"].append(lbl_key)
                 val_lbl = tk.Label(
                     self.api_stats_container,
                     text="0", font=(FONT_MONO, SZ_XS, "bold"),
-                    fg="#2d3436", bg="#f1f2f6", width=4, anchor="w"
+                    fg=T["fg_counter_v"], bg=T["bg_card"], width=4, anchor="w"
                 )
                 val_lbl.grid(row=r, column=c*2+1, padx=(0, 4), sticky="w")
                 self.stat_value_labels[key] = val_lbl
@@ -413,10 +830,9 @@ class SeoulBusArrivalRecorder:
         self.update_button_states()
 
         # 5-2-5-1. 인증키 길이 변화를 감지해 인증키 입력 버튼의 활성화를 제어합니다.
-        #   메인키가 정확히 64글자일 때만 버튼이 활성화됩니다.
         self.service_key_var.trace_add("write", lambda *_: self._check_key_btn_state())
         self.backup_key_var.trace_add("write",  lambda *_: self._check_key_btn_state())
-        self._check_key_btn_state()  # 초기 로드 시 한 번 즉시 실행
+        self._check_key_btn_state()
 
         # 5-2-7. 열쇠가 잠겨 있다면 입력칸을 읽기 전용으로 바꿉니다.
         if self.key_locked:
@@ -425,117 +841,156 @@ class SeoulBusArrivalRecorder:
             _ok = self.get_btn_style("outline")
             _ok.pop("state", None)
             self.btn_key_manage.config(text="인증키\n변경", **_ok)
+            # 버튼 타입 추적 업데이트
+            for item in self._tw["buttons"]:
+                if item[0] is self.btn_key_manage:
+                    item[1][0] = "outline"
 
         # 5-2-8. 화면 중간과 아래쪽의 위아래 크기를 조절할 수 있는 공간을 만듭니다.
-        self.super_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=6)
+        self.super_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL,
+                                          sashrelief=tk.RAISED, sashwidth=6)
         self.super_paned.pack(fill="both", expand=True)
-        self.main_paned = tk.PanedWindow(self.super_paned, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=6)
+        self.main_paned = tk.PanedWindow(self.super_paned, orient=tk.VERTICAL,
+                                         sashrelief=tk.RAISED, sashwidth=6)
         self.setup_trees()
         self.super_paned.add(self.main_paned, stretch="always", minsize=220)
 
-        # 5-2-9. 화면 제일 아래쪽에 작업 일지(로그)를 적는 까만 창을 만듭니다.
-        log_outer_frame = tk.Frame(self.super_paned, padx=10, pady=5)
-        log_scroll_frame = tk.Frame(log_outer_frame); log_scroll_frame.pack(fill="both", expand=True)
-        self.txt_log = tk.Text(log_scroll_frame, height=10, bg="#2d3436", fg="#dfe6e9",
-                               font=(FONT_MONO, SZ_S), state="disabled")  # 읽기전용: 타이핑으로 수정 불가
-        log_scrollbar = ttk.Scrollbar(log_scroll_frame, orient="vertical", command=self.txt_log.yview)
+        # 5-2-9. 화면 제일 아래쪽에 작업 일지(로그)를 적는 창을 만듭니다.
+        log_outer_frame = tk.Frame(self.super_paned, padx=10, pady=5, bg=T["bg_root"])
+        self._tw["log_outer"] = log_outer_frame
+        log_scroll_frame = tk.Frame(log_outer_frame, bg=T["bg_root"])
+        log_scroll_frame.pack(fill="both", expand=True)
+        self.txt_log = tk.Text(log_scroll_frame, height=10, bg=T["bg_log"], fg=T["fg_log"],
+                               font=(FONT_MONO, SZ_S), state="disabled")
+        log_scrollbar = ttk.Scrollbar(log_scroll_frame, orient="vertical", command=self.txt_log.yview, style="App.Vertical.TScrollbar")
         self.txt_log.configure(yscrollcommand=log_scrollbar.set)
-        self.txt_log.pack(side="left", fill="both", expand=True); log_scrollbar.pack(side="right", fill="y")
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        log_scrollbar.pack(side="right", fill="y")
         self.super_paned.add(log_outer_frame, minsize=60, height=180)
+
+        # 5-2-10. [초기 스타일 일괄 적용] 생성 직후 스크롤바·Treeview 스타일을 즉시 반영합니다.
+        self._apply_scrollbar_style(self.get_theme())
 
     # 5-3. [버스 정보판 만들기] 실시간 버스 위치와 도착 기록을 보여주는 표 생성 함수
     def setup_trees(self):
+        T = self.get_theme()
         # 5-3-1. 화면 상단에 2개의 실시간 현황 표를 배치합니다.
-        frame_rt_container = tk.Frame(self.main_paned)
-        rt_inner = tk.Frame(frame_rt_container); rt_inner.pack(fill="both", expand=True)
+        frame_rt_container = tk.Frame(self.main_paned, bg=T["bg_root"])
+        self._tw["tree_frames"].append(frame_rt_container)
+        rt_inner = tk.Frame(frame_rt_container, bg=T["bg_root"])
+        rt_inner.pack(fill="both", expand=True)
+        self._tw["tree_frames"].append(rt_inner)
         rt_inner.grid_columnconfigure(0, weight=1); rt_inner.grid_columnconfigure(1, weight=1)
         rt_inner.grid_rowconfigure(0, weight=1)
 
-        self.btn_searches = [] 
-        self.trees_rt = []; self.lbl_st_names = [] 
-        
-        # 5-3-1-1. 왼쪽(0)과 오른쪽(1)에 각각 표를 하나씩 그립니다.
-        for i in range(2): 
-            f = tk.Frame(rt_inner); f.grid(row=0, column=i, sticky="nsew", padx=2)
-            header = tk.Frame(f); header.pack(fill="x", pady=2)
-            inner_header = tk.Frame(header); inner_header.pack(anchor="center")
-            
-            # 5-3-1-2. 정류소 제목 라벨과 ARS-ID 번호 입력칸을 만듭니다.
-            lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 실시간 현황", fg="#0984e3", font=(FONT_SUB, SZ_M, "bold"))
-            lbl.pack(side="left"); self.lbl_st_names.append(lbl)
-            tk.Entry(inner_header, textvariable=self.ars_ids[i], width=10, state="readonly", readonlybackground="#f0f0f0", fg="#2d3436", font=(FONT_MONO, SZ_M, "bold")).pack(side="left", padx=5)
-            
-            # 5-3-1-3. 버스 정류소를 찾기 위한 검색 버튼을 만듭니다.
-            # 비활성 상태(disabled) 초기값: disabled 스타일로 회색 배경 표시
+        self.btn_searches = []
+        self.trees_rt = []; self.lbl_st_names = []
+
+        for i in range(2):
+            f = tk.Frame(rt_inner, bg=T["bg_root"])
+            f.grid(row=0, column=i, sticky="nsew", padx=2)
+            self._tw["tree_frames"].append(f)
+            header = tk.Frame(f, bg=T["bg_root"])
+            header.pack(fill="x", pady=2)
+            self._tw["tree_frames"].append(header)
+            inner_header = tk.Frame(header, bg=T["bg_root"])
+            inner_header.pack(anchor="center")
+            self._tw["tree_frames"].append(inner_header)
+
+            lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 실시간 현황",
+                           fg=T["fg_st1"], bg=T["bg_root"],
+                           font=(FONT_SUB, SZ_M, "bold"))
+            lbl.pack(side="left")
+            self.lbl_st_names.append(lbl)
+
+            ars_entry = tk.Entry(inner_header, textvariable=self.ars_ids[i],
+                                 width=10, state="readonly",
+                                 readonlybackground=T["bg_entry_ro"],
+                                 fg=T["fg_main"], font=(FONT_MONO, SZ_M, "bold"))
+            ars_entry.pack(side="left", padx=5)
+            self._tw["ars_entries"].append(ars_entry)
+
             _s_search = self.get_btn_style("disabled")
             _s_search.pop("state", None)
             btn_search = tk.Button(inner_header, text="검색",
-                                  command=lambda idx=i: self.open_search_window(idx),
-                                  width=5, state="disabled", **_s_search)
+                                   command=lambda idx=i: self.open_search_window(idx),
+                                   width=5, state="disabled", **_s_search)
             btn_search.pack(side="left", padx=(4, 0), ipady=1)
-            self.btn_searches.append(btn_search) 
+            self.btn_searches.append(btn_search)
+            self._tw["buttons"].append((btn_search, ["disabled"]))
 
-            # 5-3-1-4. 실시간 도착 정보 표(Treeview)를 설정합니다.
-            tree_frame = tk.Frame(f); tree_frame.pack(fill="both", expand=True)
+            tree_frame = tk.Frame(f, bg=T["bg_root"])
+            tree_frame.pack(fill="both", expand=True)
+            self._tw["tree_frames"].append(tree_frame)
             cols = ("route", "bus1_no", "bus1_msg", "bus2_no", "bus2_msg")
             tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
             for col in cols: tree.heading(col, text=self.get_col_name(col))
-            tree.column("route", width=69); tree.column("bus1_no", width=86); tree.column("bus1_msg", width=130)
-            tree.column("bus2_no", width=86); tree.column("bus2_msg", width=129)
-            
-            # 5-3-1-5. 스크롤바를 표에 붙입니다.
-            vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=vsb.set); tree.pack(side="left", fill="both", expand=True); vsb.pack(side="right", fill="y")
+            tree.column("route", width=69); tree.column("bus1_no", width=86)
+            tree.column("bus1_msg", width=130); tree.column("bus2_no", width=86)
+            tree.column("bus2_msg", width=129)
+            vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview, style="App.Vertical.TScrollbar")
+            tree.configure(yscrollcommand=vsb.set)
+            tree.pack(side="left", fill="both", expand=True)
+            vsb.pack(side="right", fill="y")
             self.trees_rt.append(tree)
-        self.main_paned.add(frame_rt_container, minsize=100) 
+        self.main_paned.add(frame_rt_container, minsize=100)
 
         # 5-3-2. 화면 하단에 2개의 도착 기록 표를 배치합니다.
-        frame_hist_container = tk.Frame(self.main_paned)
-        hist_inner = tk.Frame(frame_hist_container); hist_inner.pack(fill="both", expand=True)
+        frame_hist_container = tk.Frame(self.main_paned, bg=T["bg_root"])
+        self._tw["tree_frames"].append(frame_hist_container)
+        hist_inner = tk.Frame(frame_hist_container, bg=T["bg_root"])
+        hist_inner.pack(fill="both", expand=True)
+        self._tw["tree_frames"].append(hist_inner)
         hist_inner.grid_columnconfigure(0, weight=1); hist_inner.grid_columnconfigure(1, weight=1)
         hist_inner.grid_rowconfigure(0, weight=1)
-        
+
         self.trees_hist = []; self.lbl_hist_titles = []
         for i in range(2):
-            f = tk.Frame(hist_inner); f.grid(row=0, column=i, sticky="nsew", padx=2)
-            header = tk.Frame(f); header.pack(fill="x", pady=2)
-            inner_header = tk.Frame(header); inner_header.pack(anchor="center")
-            
-            # 5-3-2-1. 도착 기록판 제목과 기록 삭제 버튼을 만듭니다.
-            lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 도착 기록", fg="#d63031", font=(FONT_SUB, SZ_M, "bold"))
-            lbl.pack(side="left"); self.lbl_hist_titles.append(lbl)
-            # 기록 삭제 버튼: normal 스타일, 폰트 크기는 SZ_XS(한 단계 작게)
-            _s_del = self.get_btn_style("normal", font_size=SZ_XS)
-            tk.Button(inner_header, text="기록 삭제",
-                      command=lambda idx=i: self.clear_history(idx),
-                      **_s_del).pack(side="left", padx=10, ipady=1)
+            f = tk.Frame(hist_inner, bg=T["bg_root"])
+            f.grid(row=0, column=i, sticky="nsew", padx=2)
+            self._tw["tree_frames"].append(f)
+            header = tk.Frame(f, bg=T["bg_root"])
+            header.pack(fill="x", pady=2)
+            self._tw["tree_frames"].append(header)
+            inner_header = tk.Frame(header, bg=T["bg_root"])
+            inner_header.pack(anchor="center")
+            self._tw["tree_frames"].append(inner_header)
 
-            # 5-3-2-2. 도착 기록 표(Treeview)를 설정합니다.
-            tree_frame = tk.Frame(f); tree_frame.pack(fill="both", expand=True)
+            lbl = tk.Label(inner_header, text=f"[정류소 {i+1}] 도착 기록",
+                           fg=T["fg_st2"], bg=T["bg_root"],
+                           font=(FONT_SUB, SZ_M, "bold"))
+            lbl.pack(side="left")
+            self.lbl_hist_titles.append(lbl)
+
+            _s_del = self.get_btn_style("normal", font_size=SZ_XXS)
+            btn_del = tk.Button(inner_header, text="기록 삭제",
+                                command=lambda idx=i: self.clear_history(idx),
+                                **_s_del)
+            btn_del.pack(side="left", padx=10, ipady=1)
+            self._tw["buttons"].append((btn_del, ["normal"]))
+
+            tree_frame = tk.Frame(f, bg=T["bg_root"])
+            tree_frame.pack(fill="both", expand=True)
+            self._tw["tree_frames"].append(tree_frame)
             cols = ("data_time", "route", "veh_no", "corp", "status")
             tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
-            for col in cols: tree.heading(col, text=self.get_col_name(col)) 
-            tree.column("data_time", width=135); tree.column("route", width=63); tree.column("veh_no", width=94)
-            tree.column("corp", width=135); tree.column("status", width=73)
-            # 5-3-2-3. 도착 기록 표에 스크롤바를 붙입니다.
-            
-            # 스크롤바 붙이기
-            vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=vsb.set); tree.pack(side="left", fill="both", expand=True); vsb.pack(side="right", fill="y")
+            for col in cols: tree.heading(col, text=self.get_col_name(col))
+            tree.column("data_time", width=135); tree.column("route", width=63)
+            tree.column("veh_no", width=94); tree.column("corp", width=135)
+            tree.column("status", width=73)
+            vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview, style="App.Vertical.TScrollbar")
+            tree.configure(yscrollcommand=vsb.set)
+            tree.pack(side="left", fill="both", expand=True)
+            vsb.pack(side="right", fill="y")
             self.trees_hist.append(tree)
         self.main_paned.add(frame_hist_container, minsize=100)
 
-    # 3그룹 : UI 보조 함수 (UI Auxiliary function)
+        # 초기 Treeview 스타일 적용
+        self._apply_treeview_style(T)
 
-    # 5-4. [버튼 옷입히기] 컴퓨터 종류와 버튼 상태에 따라 모양을 정해주는 함수
-    # 5-4-0. [버튼 디자인 가이드]
-    #   btn_type="normal"  : 초록 그라데이션 배경 + 흰색 글자 + 입체 테두리  — 일반 활성 버튼
-    #   btn_type="outline" : 흰 배경 + 초록 테두리 + 초록 글자               — 인증키변경 버튼
-    #   btn_type="pressed" : 진한 초록 배경(눌림 효과)                        — 눌린 상태
-    #   btn_type="disabled": 연회색 배경(#e8e8e8) + 회색 글자                — 비활성 버튼
-    #   macOS에서는 배경색이 제한적이므로 별도 분기로 처리합니다.
+    # 5-4. [버튼 옷입히기] 현재 테마와 버튼 타입에 따라 스타일 딕셔너리를 반환합니다.
     def get_btn_style(self, btn_type="normal", font_size=None):
-        # 5-4-0-1. 하위 호환: 구버전에서 theme_color 문자열을 넘길 경우 자동 매핑합니다.
+        # 5-4-0-1. 하위 호환: 구버전 색상 문자열 매핑
         _color_map = {
             "#28a745": "normal", "#007bff": "normal", "#8e44ad": "normal",
             "#f1c40f": "normal", "#2ecc71": "normal",
@@ -545,127 +1000,88 @@ class SeoulBusArrivalRecorder:
             btn_type = _color_map.get(btn_type, "normal")
 
         target_sz = font_size if font_size else SZ_S
-
-        # 5-4-1. 색상 팔레트 정의
-        C_GREEN        = "#2ecc71"   # 기본 초록 배경
-        C_GREEN_DARK   = "#27ae60"   # 진한 초록 (hover / active)
-        C_GREEN_DEEPER = "#1e8449"   # 더 진한 초록 (pressed / 테두리 하단 그림자)
-        C_GREEN_PALE   = "#eafaf1"   # outline 버튼 배경 (거의 흰색)
-        C_GRAY_BG      = "#e8e8e8"   # disabled 배경
-        C_GRAY_BORDER  = "#c0c0c0"   # disabled 테두리
-        C_GRAY_FG      = "#a0a0a0"   # disabled 글자
-        C_WHITE        = "#ffffff"
-        CURSOR_HAND    = "pointinghand" if CURRENT_OS == "Darwin" else "hand2"
+        T = self.get_theme()
+        CURSOR_HAND = "pointinghand" if CURRENT_OS == "Darwin" else "hand2"
 
         if CURRENT_OS == "Darwin":
-            # ──────────────────────────────────────────────────────────────────
-            # macOS: Aqua テーマで tk.Button の bg/activebackground は
-            #        システムに上書きされますが、以下の属性は有効です:
-            #   • fg / activeforeground  → 文字色
-            #   • font                   → フォント
-            #   • highlightbackground / highlightthickness → 外枠の色・太さ
-            #   • relief / bd            → 立体感の形状
-            #   • padx / pady            → 内側余白 (ボタンの大きさに影響)
-            #   • overrelief             → ホバー時の形状変化
-            #   • cursor                 → カーソル形状
-            #
-            # macOS: Aqua 테마에서 tk.Button의 bg/activebackground 는
-            #        시스템이 덮어씁니다. 그러나 아래 항목은 유효합니다:
-            #   fg/activeforeground(글자색), highlightbackground(외곽 테두리),
-            #   relief/bd(입체감), padx/pady(내부 여백), overrelief(호버 형상),
-            #   cursor(마우스 모양)
-            # ──────────────────────────────────────────────────────────────────
+            # macOS: Aqua 테마에서 bg/activebackground는 시스템이 덮어씁니다.
+            # fg, highlightbackground, relief, bd, padx, pady, overrelief, cursor 만 유효합니다.
             if btn_type == "disabled":
                 return {
-                    "fg": C_GRAY_FG,
+                    "fg": T["btn_disabled_fg"],
                     "font": (FONT_MAIN, target_sz, "normal"),
                     "cursor": "arrow",
                     "highlightthickness": 1,
-                    "highlightbackground": C_GRAY_BORDER,
-                    "relief": "groove",
-                    "bd": 1,
-                    "padx": 6,
-                    "pady": 3,
+                    "highlightbackground": T["btn_disabled_border"],
+                    "relief": "groove", "bd": 1,
+                    "padx": 6, "pady": 3,
                     "state": "normal",
                 }
             elif btn_type == "outline":
                 return {
-                    "fg": C_GREEN_DARK,
-                    "activeforeground": C_GREEN_DEEPER,
+                    "fg": T["btn_outline_fg"],
+                    "activeforeground": T["btn_outline_fg"],
                     "font": (FONT_MAIN, target_sz, "bold"),
                     "cursor": CURSOR_HAND,
                     "highlightthickness": 2,
-                    "highlightbackground": C_GREEN_DARK,
-                    "relief": "ridge",
-                    "bd": 2,
-                    "padx": 6,
-                    "pady": 3,
+                    "highlightbackground": T["btn_outline_border"],
+                    "relief": "ridge", "bd": 2,
+                    "padx": 6, "pady": 3,
                     "overrelief": "solid",
                 }
             else:  # normal
                 return {
-                    "fg": C_GREEN_DEEPER,
-                    "activeforeground": C_GREEN_DARK,
+                    "fg": T["btn_normal_fg"],
+                    "activeforeground": T["btn_normal_fg"],
                     "font": (FONT_MAIN, target_sz, "bold"),
                     "cursor": CURSOR_HAND,
                     "highlightthickness": 2,
-                    "highlightbackground": C_GREEN,
-                    "relief": "raised",
-                    "bd": 2,
-                    "padx": 6,
-                    "pady": 3,
+                    "highlightbackground": T["btn_normal_border"],
+                    "relief": "raised", "bd": 2,
+                    "padx": 6, "pady": 3,
                     "overrelief": "solid",
                 }
         else:
-            # ──────────────────────────────────────────────────────────
-            # Windows: 배경/글자색 + 입체 테두리로 그래픽 버튼 효과를 냅니다.
-            #   - relief="raised"  + 초록 배경  → 볼록한 입체 버튼
-            #   - highlightbackground 로 외곽 테두리 색 지정
-            #   - activebackground  로 hover 색상 지정
-            # ──────────────────────────────────────────────────────────
+            # Windows / Linux
             if btn_type == "disabled":
                 return {
-                    "bg": C_GRAY_BG,
-                    "fg": C_GRAY_FG,
+                    "bg": T["btn_disabled_bg"],
+                    "fg": T["btn_disabled_fg"],
                     "font": (FONT_MAIN, target_sz, "normal"),
-                    "relief": "groove",
-                    "bd": 2,
-                    "highlightbackground": C_GRAY_BORDER,
+                    "relief": "groove", "bd": 2,
+                    "highlightbackground": T["btn_disabled_border"],
                     "highlightthickness": 1,
                     "cursor": "arrow",
                     "state": "disabled",
-                    "disabledforeground": C_GRAY_FG,
+                    "disabledforeground": T["btn_disabled_fg"],
                 }
             elif btn_type == "outline":
                 return {
-                    "bg": C_GREEN_PALE,
-                    "fg": C_GREEN_DARK,
-                    "activebackground": C_GREEN_PALE,
-                    "activeforeground": C_GREEN_DEEPER,
+                    "bg": T["btn_outline_bg"],
+                    "fg": T["btn_outline_fg"],
+                    "activebackground": T["btn_outline_bg"],
+                    "activeforeground": T["btn_outline_fg"],
                     "font": (FONT_MAIN, target_sz, "bold"),
-                    "relief": "ridge",
-                    "bd": 2,
-                    "highlightbackground": C_GREEN_DARK,
+                    "relief": "ridge", "bd": 2,
+                    "highlightbackground": T["btn_outline_border"],
                     "highlightthickness": 1,
                     "cursor": CURSOR_HAND,
                     "overrelief": "solid",
                 }
             else:  # normal
                 return {
-                    "bg": C_GREEN,
-                    "fg": C_WHITE,
-                    "activebackground": C_GREEN_DARK,
-                    "activeforeground": C_WHITE,
+                    "bg": T["btn_normal_bg"],
+                    "fg": T["btn_normal_fg"],
+                    "activebackground": T["btn_normal_active"],
+                    "activeforeground": T["btn_normal_fg"],
                     "font": (FONT_MAIN, target_sz, "bold"),
-                    "relief": "raised",
-                    "bd": 2,
-                    "highlightbackground": C_GREEN_DEEPER,
+                    "relief": "raised", "bd": 2,
+                    "highlightbackground": T["btn_normal_border"],
                     "highlightthickness": 1,
                     "cursor": CURSOR_HAND,
                     "overrelief": "solid",
                 }
-        
-    # 5-5. [이름표 번역] 영어로 된 데이터 이름을 한글로 알기 쉽게 바꿔주는 함수
+
     def get_col_name(self, code):
         mapping = {"route": "노선", "bus1_no": "1번차량", "bus1_msg": "도착정보", "bus2_no": "2번차량", "bus2_msg": "도착정보", "data_time": "데이터 시각", "veh_no": "차량번호", "corp": "운수사명", "status": "상태"}
         return mapping.get(code, code)
@@ -691,59 +1107,131 @@ class SeoulBusArrivalRecorder:
             self.stats_win.focus_force()
             return
 
+        T = self.get_theme()
+
         # 5-9-2. 새로운 창을 만듭니다.
-        self.stats_win = tk.Toplevel(self.root) 
+        self.stats_win = tk.Toplevel(self.root)
         self.stats_win.title("API 호출 상세 현황")
-        self.stats_win.geometry("680x400")
-        self.stats_win.minsize(680, 380)
-        self.stats_win.transient(self.root) 
-        self.stats_win.protocol("WM_DELETE_WINDOW", self.on_stats_win_close) 
-        
-        tk.Label(self.stats_win, text="API 호출 상세 통계  (메인키 / 백업키 / 합계 순)", font=(FONT_MAIN, SZ_M, "bold"), pady=10).pack(side="top", fill="x")
-        
-        # 5-9-3. 통계 정보를 보여줄 표를 만듭니다.
-        #        약칭 / URL / 메인키 / 백업키 / 합계 5개 열로 구성합니다.
-        # 5-9-3-1. 열 순서: 약칭 / URL / 메인키 / 백업키 / 합계 (사용자 요청 순서)
-        cols = ("abbr", "url", "main", "back", "total")
-        tree = ttk.Treeview(self.stats_win, columns=cols, show="headings") 
-        tree.heading("abbr",  text="약칭")
-        tree.heading("url",   text="API 실제 호출 주소")
-        tree.heading("main",  text="메인키")
-        tree.heading("back",  text="백업키")
-        tree.heading("total", text="합계")
-        tree.column("abbr",  width=60,  anchor="center", stretch=False)
-        tree.column("url",   width=360, anchor="w",      stretch=True)
-        tree.column("main",  width=60,  anchor="center", stretch=False)
-        tree.column("back",  width=60,  anchor="center", stretch=False)
-        tree.column("total", width=60,  anchor="center", stretch=False)
-        tree.bind('<Button-1>', self.prevent_column_resize)
-        
-        scrollbar = ttk.Scrollbar(self.stats_win, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        tree.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-        scrollbar.pack(side="right", fill="y", pady=10)
-        
-        # 5-9-4. 1초마다 숫자가 바뀌도록 계속 실행되는 함수입니다.
-        def update_stats_loop():
-            if not self.stats_win or not self.stats_win.winfo_exists():
-                return
-            for item in tree.get_children():
-                tree.delete(item)
-            total_all = 0
-            total_main = 0
-            total_back = 0
-            for key, count in self.api_stats.items():
-                url = self.api_urls.get(key, "-")
-                m_cnt = self.api_stats_by_key["main"].get(key, 0)
-                b_cnt = self.api_stats_by_key["back"].get(key, 0)
-                # 5-9-4-1. 열 순서: 약칭 / URL / 메인키 / 백업키 / 합계
-                tree.insert("", "end", values=(key, url, f"{m_cnt}", f"{b_cnt}", f"{count}"))
+        self.stats_win.geometry("720x460")
+        self.stats_win.minsize(720, 420)
+        self.stats_win.transient(self.root)
+        self.stats_win.protocol("WM_DELETE_WINDOW", self.on_stats_win_close)
+        self.stats_win.configure(bg=T["bg_panel"])
+
+        # 제목 레이블
+        lbl_title = tk.Label(self.stats_win,
+                 text="API 호출 상세 통계  (메인키 / 백업키 / 합계 순)",
+                 font=(FONT_MAIN, SZ_M, "bold"),
+                 bg=T["bg_panel"], fg=T["fg_main"], pady=8)
+        lbl_title.pack(side="top", fill="x")
+
+        # 5-9-3. Notebook 스타일 (다크/라이트)
+        sty = ttk.Style()
+        if self.is_dark_mode:
+            sty.configure("StatsNB.TNotebook",
+                          background=T["bg_panel"], borderwidth=0)
+            sty.configure("StatsNB.TNotebook.Tab",
+                          background=T["bg_card"], foreground=T["fg_sub"],
+                          padding=[8, 3])
+            sty.map("StatsNB.TNotebook.Tab",
+                    background=[("selected", T["bg_tree_sel"])],
+                    foreground=[("selected", T["fg_main"])])
+        else:
+            sty.configure("StatsNB.TNotebook",
+                          background="#ecf0f1", borderwidth=0)
+            sty.configure("StatsNB.TNotebook.Tab",
+                          background="#dfe6e9", foreground="#2d3436",
+                          padding=[8, 3])
+            sty.map("StatsNB.TNotebook.Tab",
+                    background=[("selected", "#ffffff")],
+                    foreground=[("selected", "#2d3436")])
+
+        notebook = ttk.Notebook(self.stats_win, style="StatsNB.TNotebook")
+        notebook.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # 5-9-3-1. Treeview + Scrollbar 헬퍼
+        def make_tree(parent):
+            parent.configure(bg=T["bg_panel"])
+            cols = ("abbr", "url", "main", "back", "total")
+            t = ttk.Treeview(parent, columns=cols, show="headings",
+                             style="Stats.Treeview")
+            t.heading("abbr",  text="약칭")
+            t.heading("url",   text="API 실제 호출 주소")
+            t.heading("main",  text="메인키")
+            t.heading("back",  text="백업키")
+            t.heading("total", text="합계")
+            t.column("abbr",  width=60,  anchor="center", stretch=False)
+            t.column("url",   width=385, anchor="w",      stretch=True)
+            t.column("main",  width=60,  anchor="center", stretch=False)
+            t.column("back",  width=60,  anchor="center", stretch=False)
+            t.column("total", width=65,  anchor="center", stretch=False)
+            t.bind('<Button-1>', self.prevent_column_resize)
+            sb = ttk.Scrollbar(parent, orient="vertical", command=t.yview, style="App.Vertical.TScrollbar")
+            t.configure(yscrollcommand=sb.set)
+            t.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+            sb.pack(side="right", fill="y", pady=4, padx=(0, 4))
+            return t
+
+        # Stats.Treeview 스타일 (다크/라이트)
+        if self.is_dark_mode:
+            sty.configure("Stats.Treeview",
+                background=T["bg_tree"], foreground=T["fg_tree"],
+                fieldbackground=T["bg_tree"], rowheight=22)
+            sty.configure("Stats.Treeview.Heading",
+                background=T["bg_card"], foreground=T["fg_main"], relief="flat")
+            sty.map("Stats.Treeview",
+                background=[("selected", T["bg_tree_sel"])],
+                foreground=[("selected", T["fg_main"])])
+            sty.map("Stats.Treeview.Heading",
+                background=[("active", T["border"])])
+        else:
+            sty.configure("Stats.Treeview",
+                background="#ffffff", foreground="#000000",
+                fieldbackground="#ffffff", rowheight=22)
+            sty.configure("Stats.Treeview.Heading",
+                background="#f0f0f0", foreground="#000000", relief="raised")
+            sty.map("Stats.Treeview",
+                background=[("selected", "#0078d7")],
+                foreground=[("selected", "#ffffff")])
+            sty.map("Stats.Treeview.Heading",
+                background=[("active", "#e0e0e0")])
+
+        # 5-9-3-2. 탭 1: 오늘의 합계
+        tab_today = tk.Frame(notebook, bg=T["bg_panel"])
+        notebook.add(tab_today, text="  오늘의 합계  ")
+        tree_today = make_tree(tab_today)
+
+        # 5-9-3-3. 탭 2: 어제의 합계
+        tab_yest = tk.Frame(notebook, bg=T["bg_panel"])
+        notebook.add(tab_yest, text="  어제의 합계  ")
+        tree_yest = make_tree(tab_yest)
+
+        # 5-9-4. 트리 채우기 헬퍼
+        def fill_tree(t, stats_dict, by_key_dict, label_row):
+            for item in t.get_children():
+                t.delete(item)
+            total_all = total_main = total_back = 0
+            for key, count in stats_dict.items():
+                url   = self.api_urls.get(key, "-")
+                m_cnt = by_key_dict["main"].get(key, 0)
+                b_cnt = by_key_dict["back"].get(key, 0)
+                t.insert("", "end", values=(key, url, f"{m_cnt}", f"{b_cnt}", f"{count}"))
                 total_all  += count
                 total_main += m_cnt
                 total_back += b_cnt
-            # 5-9-4-2. 맨 아래에 합계 행을 추가합니다.
-            tree.insert("", "end", values=("합계", " - ", f"{total_main}", f"{total_back}", f"{total_all}"))
-            self.stats_win.after(1000, update_stats_loop) 
+            t.insert("", "end", values=(" ", " ", " ", " ", " "))
+            t.insert("", "end", values=(label_row, " - ",
+                                        f"{total_main}", f"{total_back}", f"{total_all}"))
+
+        # 5-9-5. 1초마다 양쪽 탭을 모두 갱신합니다.
+        def update_stats_loop():
+            if not self.stats_win or not self.stats_win.winfo_exists():
+                return
+            fill_tree(tree_today, self.api_stats,
+                      self.api_stats_by_key, "오늘의 합계")
+            fill_tree(tree_yest, self.api_stats_yesterday,
+                      self.api_stats_by_key_yesterday, "어제의 합계")
+            self.stats_win.after(1000, update_stats_loop)
 
         update_stats_loop()
 
@@ -766,13 +1254,13 @@ class SeoulBusArrivalRecorder:
             style = self.get_btn_style(effective_type)
             if text:
                 style["text"] = text
-            # 5-11-2-2. state 키를 style에서 제거 — btn.config()에 state= 를 별도로 넘기므로
-            #           style 딕셔너리에 state 가 같이 있으면 "multiple values" TypeError 발생.
             style.pop("state", None)
+            # 5-11-2-3. _tw["buttons"] 추적 셀 갱신 (apply_theme 재스타일용)
+            for item in self._tw.get("buttons", []):
+                if item[0] is btn:
+                    item[1][0] = effective_type
+                    break
             if CURRENT_OS == "Darwin":
-                # macOS(Aqua 테마) 버그 우회:
-                #   state='disabled' 를 설정해도 실제 클릭이 통과되는 경우가 있습니다.
-                #   _btn_active 플래그를 함께 갱신하여 핸들러 진입 시 guard 체크합니다.
                 if btn is self.btn_toggle:
                     self._btn_active['toggle'] = is_active
                 elif btn is self.btn_manual:
@@ -943,18 +1431,22 @@ class SeoulBusArrivalRecorder:
                 self.key_locked = True
                 
                 # 5-15-1-5-2. 실수로 지우지 못하게 입력창을 회색(읽기전용)으로 잠급니다.
-                self.entry_service_key.config(state='readonly', readonlybackground='#f0f0f0')
-                self.entry_backup_key.config(state='readonly', readonlybackground='#f0f0f0')
+                self.entry_service_key.config(state='readonly', readonlybackground=self.get_theme()["bg_entry_ro"])
+                self.entry_backup_key.config(state='readonly', readonlybackground=self.get_theme()["bg_entry_ro"])
                 # 잠금 완료 → 버튼을 outline(테두리) 스타일로 변경
                 _outline = self.get_btn_style("outline")
                 _outline.pop("state", None)
                 self.btn_key_manage.config(text="인증키\n변경", **_outline)
+                for item in self._tw.get("buttons", []):
+                    if item[0] is self.btn_key_manage: item[1][0] = "outline"; break
                 
                 # 5-15-1-5-3. 이제 버스를 찾을 수 있도록 검색 버튼들을 켭니다.
                 _s_on = self.get_btn_style("normal")
                 _s_on.pop("state", None)
                 for btn in self.btn_searches:
                     btn.config(state="normal", **_s_on)
+                    for item in self._tw.get("buttons", []):
+                        if item[0] is btn: item[1][0] = "normal"; break
                 
                 # 5-15-1-5-4. VLD 통계 숫자를 올리고 열쇠를 파일에 저장합니다.
                 #             성공한 각 키(메인/백업)별로 개별 카운터도 올립니다.
@@ -975,18 +1467,24 @@ class SeoulBusArrivalRecorder:
         else:
             self.key_locked = False
             # 5-15-2-1. 입력창을 다시 하얀색으로 바꿔서 글자를 쓸 수 있게 합니다.
-            self.entry_service_key.config(state='normal', background='white')
-            self.entry_backup_key.config(state='normal', background='white')
+            _bg_e = self.get_theme()["bg_entry"]
+            _fg_e = self.get_theme()["fg_main"]
+            self.entry_service_key.config(state='normal', background=_bg_e, fg=_fg_e, insertbackground=_fg_e)
+            self.entry_backup_key.config(state='normal', background=_bg_e, fg=_fg_e, insertbackground=_fg_e)
             # 잠금 해제 → 버튼을 normal(녹색) 스타일로 복원
             _normal = self.get_btn_style("normal")
             _normal.pop("state", None)
             self.btn_key_manage.config(text="인증키\n입력", **_normal)
+            for item in self._tw.get("buttons", []):
+                if item[0] is self.btn_key_manage: item[1][0] = "normal"; break
             
             # 5-15-2-2. 열쇠를 고치는 동안에는 검색 버튼을 못 누르게 끕니다.
             _s_off = self.get_btn_style("disabled")
             _s_off.pop("state", None)
             for btn in self.btn_searches:
                 btn.config(state="disabled", **_s_off)
+                for item in self._tw.get("buttons", []):
+                    if item[0] is btn: item[1][0] = "disabled"; break
             
             # 5-15-2-3. 잠금 해제 즉시 64자 검증을 다시 적용합니다.
             self._check_key_btn_state()
@@ -1105,228 +1603,266 @@ class SeoulBusArrivalRecorder:
     # 5-17. [검색 창 열기] 버스 정류소를 찾고 기록할 버스를 고르는 팝업 창 함수
     def open_search_window(self, target_idx):
         # 5-17-1. 열쇠가 없으면 검색을 할 수 없습니다.
-        if not self.service_key_var.get().strip(): 
+        if not self.service_key_var.get().strip():
             messagebox.showwarning("알림", "인증키를 먼저 입력해주세요."); return
-        
-        # 5-17-2. 검색용 새 창을 예쁘게 만듭니다.
+
+        T = self.get_theme()
+
+        # ── Search 전용 ttk.Style ─────────────────────────────────────────
+        sty = ttk.Style()
+        if self.is_dark_mode:
+            sty.configure("Search.Treeview",
+                background=T["bg_tree"], foreground=T["fg_tree"],
+                fieldbackground=T["bg_tree"], rowheight=22)
+            sty.configure("Search.Treeview.Heading",
+                background=T["bg_card"], foreground=T["fg_main"],
+                font=(FONT_SUB, SZ_S, "bold"), relief="flat")
+            sty.map("Search.Treeview",
+                background=[("selected", T["bg_tree_sel"])],
+                foreground=[("selected", T["fg_main"])])
+            sty.map("Search.Treeview.Heading",
+                background=[("active", T["border"])])
+        else:
+            sty.configure("Search.Treeview",
+                background="#ffffff", foreground="#000000",
+                fieldbackground="#ffffff", rowheight=22)
+            sty.configure("Search.Treeview.Heading",
+                background="#dfe6e9", foreground="#2d3436",
+                font=(FONT_SUB, SZ_S, "bold"), relief="raised")
+            sty.map("Search.Treeview",
+                background=[("selected", "#0078d7")],
+                foreground=[("selected", "#ffffff")])
+            sty.map("Search.Treeview.Heading",
+                background=[("active", "#c8d6e5")])
+
+        # 5-17-2. 검색용 새 창
         search_win = tk.Toplevel(self.root)
         search_win.title(f"정류소 {target_idx+1} 검색 및 노선 선택")
         search_win.geometry("1000x850")
-        search_win.grab_set() # 5-17-2-1. 이 창을 닫기 전까지는 메인 창을 못 건들게 합니다.
+        search_win.grab_set()
         search_win.minsize(500, 500)
-        
-        # 5-17-3. 글자를 입력할 검색창을 만듭니다.
-        frame_search = tk.Frame(search_win, pady=10)
+        search_win.configure(bg=T["bg_panel"])
+
+        # 5-17-3. 검색 입력 행
+        frame_search = tk.Frame(search_win, pady=10, bg=T["bg_panel"])
         frame_search.pack(fill="x")
-        tk.Label(frame_search, text="정류소명/ID:", font=(FONT_MAIN, SZ_S)).pack(side="left", padx=(15,5))
-        search_ent = tk.Entry(frame_search, width=30)
+        tk.Label(frame_search, text="정류소명/ID:", font=(FONT_MAIN, SZ_S),
+                 bg=T["bg_panel"], fg=T["fg_main"]).pack(side="left", padx=(15,5))
+        search_ent = tk.Entry(frame_search, width=30,
+                              bg=T["bg_entry"], fg=T["fg_main"],
+                              insertbackground=T["fg_main"])
         search_ent.pack(side="left", padx=5)
-        search_ent.focus_set() # 5-17-3-1. 창이 열리자마자 바로 글자를 쓸 수 있게 합니다.
-        
-        # 5-17-4. 찾은 정류소들을 목록으로 보여주는 표를 만듭니다.
-        tree_st_frame = tk.Frame(search_win)
+        search_ent.focus_set()
+
+        # 5-17-4. 정류소 목록 표
+        tree_st_frame = tk.Frame(search_win, bg=T["bg_panel"])
         tree_st_frame.pack(fill="x", padx=15, pady=5)
-        self.style.configure("Search.Treeview.Heading", background="#dfe6e9", font=(FONT_SUB, SZ_S, "bold"))
-        st_scroll = ttk.Scrollbar(tree_st_frame, orient="vertical")
-        tree_st = ttk.Treeview(tree_st_frame, columns=("name", "arsid"), show="headings", height=5, style="Search.Treeview", yscrollcommand=st_scroll.set)
+        st_scroll = ttk.Scrollbar(tree_st_frame, orient="vertical", style="App.Vertical.TScrollbar")
+        tree_st = ttk.Treeview(tree_st_frame, columns=("name", "arsid"),
+                               show="headings", height=5,
+                               style="Search.Treeview",
+                               yscrollcommand=st_scroll.set)
         st_scroll.config(command=tree_st.yview)
-        tree_st.heading("name", text="정류소명")
+        tree_st.heading("name",  text="정류소명")
         tree_st.heading("arsid", text="ARS-ID")
-        tree_st.column("name", width=659, stretch=True)
+        tree_st.column("name",  width=659, stretch=True)
         tree_st.column("arsid", width=141, stretch=True)
-        tree_st.bind('<Button-1>', self.prevent_column_resize)
+        tree_st.bind("<Button-1>", self.prevent_column_resize)
         tree_st.pack(side="left", fill="both", expand=True)
         st_scroll.pack(side="right", fill="y")
 
-        # 5-17-5. 버스 노선을 고를 때 쓸 버튼들을 배치합니다.
-        btn_action_frame = tk.Frame(search_win)
+        # 5-17-5. 노선 선택 버튼 행
+        btn_action_frame = tk.Frame(search_win, bg=T["bg_panel"])
         btn_action_frame.pack(fill="x", padx=15, pady=5)
-        tk.Label(btn_action_frame, text="▼ 노선 선택", font=(FONT_SUB, SZ_S, "bold"), fg="#2980b9").pack(side="left")
+        lbl_route_sel = tk.Label(btn_action_frame, text="▼ 노선 선택",
+                                  font=(FONT_SUB, SZ_S, "bold"),
+                                  fg=T["fg_accent"], bg=T["bg_panel"])
+        lbl_route_sel.pack(side="left")
 
-        self.current_route_data = [] 
-        self.sort_state = {'key': None, 'reverse': False} 
-        type_order = {"간선": 0, "지선": 1, "광역": 2, "기타": 3, "경기": 4, "인천": 5} 
+        self.current_route_data = []
+        self.sort_state = {"key": None, "reverse": False}
+        type_order = {"간선": 0, "지선": 1, "광역": 2, "기타": 3, "경기": 4, "인천": 5}
 
-        # 5-17-6. 버스 목록을 다시 그리는 도우미 기능
-        def update_route_tree_view(): 
+        def update_route_tree_view():
             render_route_list()
 
-        # 5-17-7. 목록에 있는 모든 버스를 한 번에 고르거나 취소하는 기능
-        def set_all_check(status): 
-            for item in self.current_route_data: 
-                item['checked'].set(status)
+        def set_all_check(status):
+            for item in self.current_route_data:
+                item["checked"].set(status)
             update_route_tree_view()
 
-        tk.Button(btn_action_frame, text="전체 해제", command=lambda: set_all_check(False), font=(FONT_SUB, SZ_XS)).pack(side="right", padx=2)
-        tk.Button(btn_action_frame, text="전체 선택", command=lambda: set_all_check(True), font=(FONT_SUB, SZ_XS)).pack(side="right", padx=2)
+        _btn_s = self.get_btn_style("normal", font_size=SZ_XS)
+        btn_all_off = tk.Button(btn_action_frame, text="전체 해제",
+                                command=lambda: set_all_check(False), **_btn_s)
+        btn_all_off.pack(side="right", padx=2)
+        btn_all_on = tk.Button(btn_action_frame, text="전체 선택",
+                               command=lambda: set_all_check(True), **_btn_s)
+        btn_all_on.pack(side="right", padx=2)
 
-        # 5-17-8. 선택한 정류소를 지나가는 버스들의 상세 정보를 보여줄 큰 표를 만듭니다.
-        frame_route_list = tk.Frame(search_win, bd=1, relief="sunken")
+        # 5-17-8. 노선 목록 표
+        frame_route_list = tk.Frame(search_win, bd=1, relief="sunken",
+                                    bg=T["bg_panel"])
         frame_route_list.pack(fill="both", expand=True, padx=15, pady=5)
-        route_scroll = ttk.Scrollbar(frame_route_list, orient="vertical")
+        route_scroll = ttk.Scrollbar(frame_route_list, orient="vertical", style="App.Vertical.TScrollbar")
         route_cols = ("status", "rnm", "rtype", "path", "term", "f_tm", "l_tm", "st_cnt")
-        tree_route = ttk.Treeview(frame_route_list, columns=route_cols, show="headings", 
-                                  yscrollcommand=route_scroll.set, style="Search.Treeview", 
-                                  selectmode="none") 
+        tree_route = ttk.Treeview(frame_route_list, columns=route_cols,
+                                  show="headings",
+                                  yscrollcommand=route_scroll.set,
+                                  style="Search.Treeview",
+                                  selectmode="none")
         route_scroll.config(command=tree_route.yview)
-        
-        # 5-17-8-1. 고른 버스는 연두색, 안 고른 버스는 하얀색으로 칠합니다.
-        tree_route.tag_configure("selected", background="#d4edda", foreground="#155724") 
-        tree_route.tag_configure("unselected", background="white", foreground="black") 
-        
-        # 5-17-8-2. 표의 제목들을 설정합니다. (제목을 누르면 순서대로 정렬됩니다.)
-        tree_route.heading("status", text="선택여부")
-        tree_route.column("status", width=42, anchor="center", stretch=True)
-        tree_route.heading("rnm", text="노선번호", command=lambda: sort_data('rnm'))
-        tree_route.column("rnm", width=117, anchor="center", stretch=True)
-        tree_route.heading("rtype", text="유형", command=lambda: sort_data('rtype'))
-        tree_route.column("rtype", width=50, anchor="center", stretch=True)
-        tree_route.heading("path", text="기점↔종점")
-        tree_route.column("path", width=347, anchor="center", stretch=True)
-        tree_route.heading("term", text="배차간격")
-        tree_route.column("term", width=50, anchor="center", stretch=True)
-        tree_route.heading("f_tm", text="첫차시각")
-        tree_route.column("f_tm", width=67, anchor="center", stretch=True)
-        tree_route.heading("l_tm", text="막차시각")
-        tree_route.column("l_tm", width=67, anchor="center", stretch=True)
-        tree_route.heading("st_cnt", text="정류장수")
-        tree_route.column("st_cnt", width=60, anchor="center", stretch=True)
-        
-        tree_route.bind('<Button-1>', self.prevent_column_resize)
+
+        # 5-17-8-1. 선택/미선택 태그 색상 (테마 반응)
+        if self.is_dark_mode:
+            tree_route.tag_configure("selected",   background="#1a472a", foreground="#a8e6b5")
+            tree_route.tag_configure("unselected", background=T["bg_tree"],  foreground=T["fg_tree"])
+        else:
+            tree_route.tag_configure("selected",   background="#d4edda", foreground="#155724")
+            tree_route.tag_configure("unselected", background="white",   foreground="black")
+
+        # 5-17-8-2. 열 제목
+        tree_route.heading("status",  text="선택여부")
+        tree_route.column("status",   width=42,  anchor="center", stretch=True)
+        tree_route.heading("rnm",     text="노선번호", command=lambda: sort_data("rnm"))
+        tree_route.column("rnm",      width=117, anchor="center", stretch=True)
+        tree_route.heading("rtype",   text="유형",     command=lambda: sort_data("rtype"))
+        tree_route.column("rtype",    width=50,  anchor="center", stretch=True)
+        tree_route.heading("path",    text="기점↔종점")
+        tree_route.column("path",     width=347, anchor="center", stretch=True)
+        tree_route.heading("term",    text="배차간격")
+        tree_route.column("term",     width=50,  anchor="center", stretch=True)
+        tree_route.heading("f_tm",    text="첫차시각")
+        tree_route.column("f_tm",     width=67,  anchor="center", stretch=True)
+        tree_route.heading("l_tm",    text="막차시각")
+        tree_route.column("l_tm",     width=67,  anchor="center", stretch=True)
+        tree_route.heading("st_cnt",  text="정류장수")
+        tree_route.column("st_cnt",   width=60,  anchor="center", stretch=True)
+        tree_route.bind("<Button-1>", self.prevent_column_resize)
         tree_route.pack(side="left", fill="both", expand=True)
         route_scroll.pack(side="right", fill="y")
 
-        # 5-17-9. [진짜 검색] 내가 쓴 글자로 정류소를 찾아내는 똑똑한 함수
+        # 5-17-9. 검색 실행 함수
         def perform_search(event=None):
             keyword = search_ent.get().strip()
-            if not keyword: return 
-            
-            # 5-17-9-1. 예전에 찾았던 목록은 깨끗하게 지웁니다.
+            if not keyword: return
             for i in tree_st.get_children():
-                tree_st.delete(i) 
-            
+                tree_st.delete(i)
             root_res = None
-            is_digit_search = keyword.isdigit() and len(keyword) >= 3 
-
-            # 5-17-9-2. 숫자만 썼다면 정류소 번호(ARS-ID)로 먼저 찾아봅니다.
+            is_digit_search = keyword.isdigit() and len(keyword) >= 3
             if is_digit_search:
-                root_res = self.fetch_api("http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid", {'arsId': keyword})
-            
-            # 5-17-9-3. 번호로 못 찾았거나 글자를 썼다면 정류소 이름으로 다시 찾아봅니다.
+                root_res = self.fetch_api(
+                    "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid",
+                    {"arsId": keyword})
             if root_res is None or not root_res.findall(".//itemList"):
-                if is_digit_search:
-                    pass  # self.log(f"ℹ ARS-ID({keyword}) 검색 결과 없음 -> 명칭 검색으로 재시도합니다.")
-                root_res = self.fetch_api("http://ws.bus.go.kr/api/rest/stationinfo/getStationByName", {'stSrch': keyword})
-            
-            # 5-17-9-4. 찾은 결과가 있다면 목록에 하나씩 올려줍니다.
+                root_res = self.fetch_api(
+                    "http://ws.bus.go.kr/api/rest/stationinfo/getStationByName",
+                    {"stSrch": keyword})
             insert_count = 0
             seen_stations = set()
             if root_res is not None:
-                items = root_res.findall(".//itemList")
-                for item in items:
-                    name = item.findtext("stNm")
+                for item in root_res.findall(".//itemList"):
+                    name   = item.findtext("stNm")
                     ars_id = item.findtext("arsId")
-                    if ars_id and ars_id != "0": 
+                    if ars_id and ars_id != "0":
                         key = (name, str(ars_id))
                         if key not in seen_stations:
                             seen_stations.add(key)
-                            tree_st.insert("", "end", values=key) 
+                            tree_st.insert("", "end", values=key)
                             insert_count += 1
-            
-            # 5-17-9-5. 아무것도 못 찾았다면 없다고 알려줍니다.
             if insert_count == 0:
                 tree_st.insert("", "end", values=("검색 결과가 없습니다.", ""))
 
-        search_ent.bind("<Return>", perform_search) # 5-17-9-6. 엔터키를 쳐도 검색이 됩니다.
-        tk.Button(frame_search, text="검색", command=perform_search, font=(FONT_SUB, SZ_XS)).pack(side="left", padx=5)
+        search_ent.bind("<Return>", perform_search)
+        _btn_search = self.get_btn_style("normal", font_size=SZ_XS)
+        tk.Button(frame_search, text="검색", command=perform_search,
+                  **_btn_search).pack(side="left", padx=5)
 
-        # 5-17-10. [정렬하기] 목록을 가나다순이나 버스 종류별로 정리하는 함수
+        # 5-17-10. 정렬 함수
         def sort_data(key):
-            if self.sort_state['key'] == key:
-                self.sort_state['reverse'] = not self.sort_state['reverse'] 
+            if self.sort_state["key"] == key:
+                self.sort_state["reverse"] = not self.sort_state["reverse"]
             else:
-                self.sort_state['key'] = key
-                self.sort_state['reverse'] = False
-            
-            if key == 'rtype':
-                self.current_route_data.sort(key=lambda x: (type_order.get(x['rtype'], 99), x['rnm']), reverse=self.sort_state['reverse'])
+                self.sort_state["key"] = key
+                self.sort_state["reverse"] = False
+            if key == "rtype":
+                self.current_route_data.sort(
+                    key=lambda x: (type_order.get(x["rtype"], 99), x["rnm"]),
+                    reverse=self.sort_state["reverse"])
             else:
-                self.current_route_data.sort(key=lambda x: x[key], reverse=self.sort_state['reverse'])
+                self.current_route_data.sort(
+                    key=lambda x: x[key],
+                    reverse=self.sort_state["reverse"])
             render_route_list()
 
-        # 5-17-11. [보여주기] 찾은 버스 정보들을 표에 실제로 채워넣는 함수
+        # 5-17-11. 노선 목록 렌더링
         def render_route_list():
             for item in tree_route.get_children():
                 tree_route.delete(item)
             for item in self.current_route_data:
-                status_text = "V" if item['checked'].get() else "" 
-                tag = "selected" if item['checked'].get() else "unselected"
-                vals = [status_text] + item['data_vals']
-                tree_route.insert("", "end", iid=item['rid'], values=vals, tags=(tag,))
+                status_text = "V" if item["checked"].get() else ""
+                tag = "selected" if item["checked"].get() else "unselected"
+                vals = [status_text] + item["data_vals"]
+                tree_route.insert("", "end", iid=item["rid"], values=vals, tags=(tag,))
 
-        # 5-17-12. [버스 고르기] 목록에서 버스를 클릭하면 체크박스가 켜졌다 꺼졌다 하는 함수
+        # 5-17-12. 노선 클릭 체크토글
         def on_route_click(event):
             if tree_route.identify_region(event.x, event.y) == "separator":
                 return "break"
-                
             item_id = tree_route.identify_row(event.y)
             if not item_id: return
             for item in self.current_route_data:
-                if item['rid'] == item_id:
-                    new_state = not item['checked'].get() 
-                    item['checked'].set(new_state)
+                if item["rid"] == item_id:
+                    new_state = not item["checked"].get()
+                    item["checked"].set(new_state)
                     cur_values = list(tree_route.item(item_id, "values"))
                     cur_values[0] = "V" if new_state else ""
-                    tree_route.item(item_id, values=cur_values, tags=("selected" if new_state else "unselected",))
+                    tree_route.item(item_id, values=cur_values,
+                                    tags=("selected" if new_state else "unselected",))
                     break
         tree_route.bind("<Button-1>", on_route_click)
 
-        # 5-17-13. [버스 불러오기] 정류소를 고르면 그곳에 정차하는 모든 버스를 서버에서 가져오는 함수
+        # 5-17-13. 정류소 선택 시 노선 목록 불러오기
         def on_station_select(event):
             selected = tree_st.selection()
             if not selected: return
-            ars_id = str(tree_st.item(selected[0])['values'][1]).zfill(5) 
+            ars_id = str(tree_st.item(selected[0])["values"][1]).zfill(5)
             if not ars_id or ars_id == "": return
-            
-            # 5-17-13-1. 예전에 골랐던 버스가 있다면 기억해둡니다.
             saved_checked_routes = set()
-            if self.ars_ids[target_idx].get().strip() == ars_id and self.target_st_info[target_idx].get('routes'):
-                saved_checked_routes = {r[0] for r in self.target_st_info[target_idx]['routes']}
-            
+            if self.ars_ids[target_idx].get().strip() == ars_id and self.target_st_info[target_idx].get("routes"):
+                saved_checked_routes = {r[0] for r in self.target_st_info[target_idx]["routes"]}
             self.current_route_data.clear()
-            # 5-17-13-1-1. 정류소가 바뀌면 SLST·ord 캐시를 초기화합니다.
-            #   새 정류소의 ars_id에 맞는 ord 값이 달라질 수 있기 때문입니다.
             self._strt_cache.clear()
             self._strt_ord_cache.clear()
-            # 5-17-13-2. 이 정류소에 어떤 버스가 오는지 서버에 물어봅니다.
-            root_route = self.fetch_api("http://ws.bus.go.kr/api/rest/stationinfo/getRouteByStation", {'arsId': ars_id})
+            root_route = self.fetch_api(
+                "http://ws.bus.go.kr/api/rest/stationinfo/getRouteByStation",
+                {"arsId": ars_id})
             if root_route is not None:
-                type_map = {"1":"공항", "2":"마을", "3":"간선", "4":"지선", "5":"순환", "6":"광역", "7":"인천", "8":"경기", "9":"폐지", "0":"공용"}
+                type_map = {"1":"공항","2":"마을","3":"간선","4":"지선","5":"순환",
+                            "6":"광역","7":"인천","8":"경기","9":"폐지","0":"공용"}
                 for it in root_route.findall(".//itemList"):
                     rid, rnm = it.findtext("busRouteId"), it.findtext("busRouteNm")
-                    # 5-17-13-3. 각 버스의 배차간격이나 첫차 시간을 더 자세히 알아봅니다.
-                    root_info = self.fetch_api("http://ws.bus.go.kr/api/rest/busRouteInfo/getRouteInfo", {'busRouteId': rid})
-                    rtype, path, term, f_tm, l_tm, st_cnt_str = "-", "-", "-", "-", "-", "-"
+                    root_info = self.fetch_api(
+                        "http://ws.bus.go.kr/api/rest/busRouteInfo/getRouteInfo",
+                        {"busRouteId": rid})
+                    rtype, path, term, f_tm, l_tm, st_cnt_str = "-","-","-","-","-","-"
                     st_cnt_val = 100
                     if root_info is not None:
                         info = root_info.find(".//itemList")
                         if info is not None:
                             rtype = type_map.get(info.findtext("routeType"), "기타")
-                            path = f"{info.findtext('stStationNm')}↔{info.findtext('edStationNm')}"
-                            term = info.findtext("term") + "분"; f_tm = self.format_hhmm(info.findtext("firstBusTm", "-"))
-                            l_tm = self.format_hhmm(info.findtext("lastBusTm", "-"))
-                            self.route_corp_map[rid] = info.findtext("corpNm", "정보없음") 
-                            # 5-17-13-4. 이 버스가 몇 개의 정류장을 거쳐 가는지 알아봅니다.
-                            #   동시에 이 정류소의 순번(ord)도 캐시해 두어
-                            #   confirm_selection 에서 재호출 없이 재사용합니다.
-                            root_st_list = self.fetch_api("http://ws.bus.go.kr/api/rest/busRouteInfo/getStaionByRoute", {'busRouteId': rid})
+                            path  = f"{info.findtext('stStationNm')}↔{info.findtext('edStationNm')}"
+                            term  = info.findtext("term") + "분"
+                            f_tm  = self.format_hhmm(info.findtext("firstBusTm", "-"))
+                            l_tm  = self.format_hhmm(info.findtext("lastBusTm", "-"))
+                            self.route_corp_map[rid] = info.findtext("corpNm", "정보없음")
+                            root_st_list = self.fetch_api(
+                                "http://ws.bus.go.kr/api/rest/busRouteInfo/getStaionByRoute",
+                                {"busRouteId": rid})
                             if root_st_list is not None:
                                 st_list_items = root_st_list.findall(".//itemList")
                                 st_cnt_val = len(st_list_items)
                                 st_cnt_str = f"{st_cnt_val}개"
-                                # 5-17-13-4-1. 응답 전체를 캐시에 보관합니다.
                                 self._strt_cache[rid] = root_st_list
-                                # 5-17-13-4-2. 현재 정류소의 순번(seq)을 미리 추출해 ord 캐시에 저장합니다.
                                 for _si in st_list_items:
                                     _item_ars = str(_si.findtext("arsId") or "").zfill(5)
                                     if _item_ars == ars_id:
@@ -1334,117 +1870,90 @@ class SeoulBusArrivalRecorder:
                                         if _ord_val:
                                             self._strt_ord_cache[rid] = _ord_val
                                         break
-                    
                     self.rid_to_rnm[rid] = rnm
-                    is_checked = (rid in saved_checked_routes) if saved_checked_routes else True 
+                    is_checked = (rid in saved_checked_routes) if saved_checked_routes else True
                     self.current_route_data.append({
-                        'rid': rid, 'rnm': rnm, 'rtype': rtype, 'st_cnt': st_cnt_val,
-                        'data_vals': [rnm, rtype, path, term, f_tm, l_tm, st_cnt_str],
-                        'checked': tk.BooleanVar(value=is_checked)
+                        "rid": rid, "rnm": rnm, "rtype": rtype, "st_cnt": st_cnt_val,
+                        "data_vals": [rnm, rtype, path, term, f_tm, l_tm, st_cnt_str],
+                        "checked": tk.BooleanVar(value=is_checked)
                     })
-            
-            # 5-17-13-5. 보기 좋게 버스 종류별로 정렬해서 보여줍니다.
-            self.sort_state = {'key': 'rtype', 'reverse': False}
-            self.current_route_data.sort(key=lambda x: (type_order.get(x['rtype'], 99), x['rnm']))
+            self.sort_state = {"key": "rtype", "reverse": False}
+            self.current_route_data.sort(
+                key=lambda x: (type_order.get(x["rtype"], 99), x["rnm"]))
             render_route_list()
-        
-        tree_st.bind("<<TreeviewSelect>>", on_station_select) 
 
-        # 5-17-14. 이미 입력된 정류소가 있다면 창이 열릴 때 바로 보여줍니다.
-        # 5-17-14-1. selection_set 이 <<TreeviewSelect>> 이벤트를 자동 발화하므로
-        #   on_station_select 를 직접 다시 호출하지 않습니다.
-        #   (이전 버전에서 두 번 호출해 SLST 가 2N번 발생하던 문제를 수정했습니다.)
+        tree_st.bind("<<TreeviewSelect>>", on_station_select)
+
+        # 5-17-14. 이미 입력된 정류소 자동 표시
         if self.ars_ids[target_idx].get().strip():
-            item_id = tree_st.insert("", "end", values=(self.target_st_info[target_idx].get('nm', ''), self.ars_ids[target_idx].get()))
+            item_id = tree_st.insert("", "end",
+                values=(self.target_st_info[target_idx].get("nm", ""),
+                        self.ars_ids[target_idx].get()))
             tree_st.selection_set(item_id)
-            # on_station_select(None)  ← 제거: selection_set 이 이벤트를 자동 발화합니다.
 
-        # 5-17-15. [결정] 고른 버스들을 진짜로 프로그램에 적용하는 함수
+        # 5-17-15. 노선 확정 함수
         def confirm_selection():
-            # 5-17-15-1. 체크된 버스들만 골라냅니다.
-            chosen = [(item['rid'], item['rnm'], item['st_cnt']) for item in self.current_route_data if item['checked'].get()]
+            chosen = [(item["rid"], item["rnm"], item["st_cnt"])
+                      for item in self.current_route_data if item["checked"].get()]
             selected_st = tree_st.selection()
             if not selected_st or not chosen: return
-            st_name, ars_id = tree_st.item(selected_st[0])['values'][0], str(tree_st.item(selected_st[0])['values'][1]).zfill(5)
-            
-            # 5-17-15-2. 메인 화면의 정류소 이름을 바꿉니다.
+            st_name = tree_st.item(selected_st[0])["values"][0]
+            ars_id  = str(tree_st.item(selected_st[0])["values"][1]).zfill(5)
             self.ars_ids[target_idx].set(ars_id)
             self.lbl_st_names[target_idx].config(text=f"[{st_name}] 실시간 현황")
             self.lbl_hist_titles[target_idx].config(text=f"[{st_name}] 도착 기록")
-            
-            # 5-17-15-3. 정류소의 고유 번호(stId)를 알아내어 저장합니다.
-            root_st_uid = self.fetch_api("http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid", {'arsId': ars_id})
-            st_id = root_st_uid.findtext(".//stId") if (root_st_uid is not None and not isinstance(root_st_uid, tuple)) else ""
-
-            # 5-17-15-4. 각 노선의 이 정류소 순번(ord)을 미리 알아둡니다.
-            #   getArrInfoByRoute 호출 시 stId + busRouteId + ord 가 모두 필요하기 때문입니다.
-            #   getStaionByRoute 응답의 각 itemList에는 arsId 와 seq(순번) 필드가 있습니다.
-            #
-            # 5-17-15-4-1. [SLST 캐시 전략]
-            #   on_station_select 에서 각 노선의 getStaionByRoute 결과를 _strt_cache 에,
-            #   해당 정류소의 seq(순번)를 _strt_ord_cache 에 미리 저장해 두었습니다.
-            #   confirm_selection 에서는 이 캐시를 그대로 사용하므로 추가 API 호출이 없습니다.
-            #   → 정류소 1개·노선 N개 선택 시 SLST 호출은 N번(on_station_select)에서 끝납니다.
-            #
-            # 5-17-15-4-2. 정류소가 다시 선택될 때는 suspend·veh_cache도 정리합니다.
-            if hasattr(self, 'target_st_info') and self.target_st_info[target_idx].get('routes'):
-                old_rids = {r[0] for r in self.target_st_info[target_idx]['routes']}
-                new_rids  = {r[0] for r, *_ in chosen}  # type: ignore[misc]
-                new_rids  = {item[0] for item in chosen}
+            root_st_uid = self.fetch_api(
+                "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid",
+                {"arsId": ars_id})
+            st_id = root_st_uid.findtext(".//stId") if (
+                root_st_uid is not None and not isinstance(root_st_uid, tuple)) else ""
+            if hasattr(self, "target_st_info") and self.target_st_info[target_idx].get("routes"):
+                old_rids = {r[0] for r in self.target_st_info[target_idx]["routes"]}
+                new_rids = {item[0] for item in chosen}
                 gone = old_rids - new_rids
                 for rid in gone:
                     self.pos_suspend_until.pop(rid, None)
-                    # 5-17-15-4-2-1. 사라진 노선의 차량번호 캐시도 제거합니다.
-                    old_st_id = self.target_st_info[target_idx].get('id', '')
+                    old_st_id = self.target_st_info[target_idx].get("id", "")
                     self.veh_cache.pop((old_st_id, rid), None)
-
-            ord_map = {}  # {busRouteId: ord}
+            ord_map = {}
             for rid, rnm, _ in chosen:
-                # 5-17-15-4-3. on_station_select 에서 미리 채운 ord 캐시를 우선 사용합니다.
                 if rid in self._strt_ord_cache:
                     ord_map[rid] = self._strt_ord_cache[rid]
-                    # 5-17-15-4-3-1. SLST API 재호출 없이 캐시 값으로 처리합니다.
                 elif rid in self._strt_cache:
-                    # 5-17-15-4-3-2. ord 캐시는 없지만 SLST 응답은 있는 경우 직접 탐색합니다.
                     root_strt = self._strt_cache[rid]
                     for st_item in root_strt.findall(".//itemList"):
                         item_ars = str(st_item.findtext("arsId") or "").zfill(5)
                         if item_ars == ars_id:
                             ord_val = st_item.findtext("seq") or st_item.findtext("staOrd") or ""
-                            if ord_val:
-                                ord_map[rid] = ord_val
+                            if ord_val: ord_map[rid] = ord_val
                             break
                 else:
-                    # 5-17-15-4-3-3. 캐시가 전혀 없는 예외적 상황에만 API를 호출합니다.
-                    #   (정상적으로는 on_station_select 에서 이미 채워져 있어야 합니다.)
                     self.log(f"⚠ SLST 캐시 누락: {rnm}번 — 재호출합니다.")
                     root_strt = self.fetch_api(
                         "http://ws.bus.go.kr/api/rest/busRouteInfo/getStaionByRoute",
-                        {'busRouteId': rid}
-                    )
+                        {"busRouteId": rid})
                     if root_strt is not None and not isinstance(root_strt, tuple):
                         for st_item in root_strt.findall(".//itemList"):
                             item_ars = str(st_item.findtext("arsId") or "").zfill(5)
                             if item_ars == ars_id:
                                 ord_val = st_item.findtext("seq") or st_item.findtext("staOrd") or ""
-                                if ord_val:
-                                    ord_map[rid] = ord_val
+                                if ord_val: ord_map[rid] = ord_val
                                 break
-
-            # 5-17-15-5. 정류소 선택이 완료되면 SLST·ord 캐시를 비워서 다음 선택 때 새로 받습니다.
             self._strt_cache.clear()
             self._strt_ord_cache.clear()
-            
-            self.target_st_info[target_idx] = {'id': st_id, 'nm': st_name, 'routes': chosen, 'ord_map': ord_map}
-            self.log(f"정류소 {target_idx+1} 설정 완료: {st_name} (노선 선택 완료 : 총 {len(ord_map)}개 노선 중, {len(chosen)}개 노선 선택)")
-            search_win.destroy() 
-            self.update_button_states() 
-            
-        # 5-17-16. 최종 확인 버튼을 창 아래에 만듭니다.
-        tk.Button(search_win, text="선택한 노선들로 적용", command=confirm_selection, 
-                  height=2,
-                  **self.get_btn_style("#27ae60", font_size=SZ_M) 
+            self.target_st_info[target_idx] = {
+                "id": st_id, "nm": st_name, "routes": chosen, "ord_map": ord_map}
+            self.log(f"정류소 {target_idx+1} 설정 완료: {st_name} "
+                     f"(총 {len(ord_map)}개 노선 중 {len(chosen)}개 선택)")
+            search_win.destroy()
+            self.update_button_states()
+
+        # 5-17-16. 최종 확인 버튼
+        tk.Button(search_win, text="선택한 노선들로 적용",
+                  command=confirm_selection, height=2,
+                  **self.get_btn_style("normal", font_size=SZ_M)
         ).pack(fill="x", padx=15, pady=10)
+
 
     # 5-18. [정보 가져오기] 고른 정류소의 버스 도착 시간과 위치를 실제로 확인하는 함수
     def process_station(self, idx):
@@ -1455,6 +1964,20 @@ class SeoulBusArrivalRecorder:
             self.pos_suspend_until.clear()
             # veh_cache는 (st_id, rid) 기반으로 날짜와 무관하게 유효하므로 자정에 초기화하지 않습니다.
             self.log("📅 날짜가 바뀌었습니다. POS1 일시정지 기록을 초기화합니다.")
+
+            # 5-18-0-1. [자정 API 카운트 초기화] 00:00 날짜 전환 시 모든 API 호출 횟수를 0으로 리셋합니다.
+            #   메인창 상단의 합산 카운트(api_stats)와
+            #   API 상세 통계 창의 키별 카운트(api_stats_by_key)를 동시에 초기화합니다.
+            #   idx == 0 일 때만 실행해 정류소 1·2 처리 중 두 번 초기화되는 것을 막습니다.
+            if idx == 0:
+                for k in self.api_stats:
+                    self.api_stats[k] = 0
+                for k in self.api_stats_by_key["main"]:
+                    self.api_stats_by_key["main"][k] = 0
+                for k in self.api_stats_by_key["back"]:
+                    self.api_stats_by_key["back"][k] = 0
+                self.root.after(0, self.update_api_counter_ui)
+                self.log("📊 API 호출 횟수가 00:00 기준으로 초기화되었습니다.")
 
         # 5-18-1. 어떤 정류소를 확인해야 하는지 정보를 가져옵니다.
         info, ars_id = self.target_st_info[idx], self.ars_ids[idx].get().strip()
@@ -1495,13 +2018,6 @@ class SeoulBusArrivalRecorder:
             self.log(f"ℹ ARR1 초과 → SINF 보조 호출 완료 (정류소 {idx+1}, {len(by_rid)}개 노선 수신)")
             return uid_cache
 
-        # ARR1 루프에서 운행종료로 판정된 노선 ID를 기록 → POS 루프에서 건너뜁니다.
-        # 판단 기준: arrmsg1/arrmsg2 가 모두 NO_BUS_MSGS 에 해당하는 경우
-        #   (차량번호가 응답에 포함되더라도 서울시 API 오류로 남아있는 경우가 있으므로
-        #    arrmsg 기준으로만 운행종료 여부를 판정합니다.)
-        NO_BUS_MSGS = {"운행정보없음", "운행종료", "출발대기", "-", ""}
-        arr_ended_rids = set()  # 이번 갱신에서 ARR1이 운행종료로 판정한 노선 집합
-
         # 노선마다 ARR1 우선 시도, 실패 시 SINF 캐시에서 해당 노선 항목만 추출
         for rid, rnm, _ in info.get('routes', []):
             row = None
@@ -1512,24 +2028,22 @@ class SeoulBusArrivalRecorder:
             root_arr = self.fetch_api("", arr_params, api_type="ARR1")
 
             if root_arr is not None and not isinstance(root_arr, tuple):
-                # 5-18-2-1-0. [운행 상태 판정] arrmsg 기준으로 실제 운행 여부를 판단합니다.
-                #   판단 기준 (arrmsg1/arrmsg2 둘 다 NO_BUS_MSGS → 운행종료):
-                #     ※ plainNo1/2에 차량번호가 있어도 서울시 API 오류로 남아있는 경우가 있어
-                #        arrmsg 값만을 운행종료 판정의 기준으로 사용합니다.
+                # 5-18-2-1-0. [노선 재출현] ARR1 응답에 실제 운행 버스가 있을 때만 POS 정지 해제
+                #   판단 기준: arrmsg1 또는 arrmsg2 가 운행 없음 메시지 이외의 값(예: "3분 후")인 경우만 운행 중으로 판정합니다.
+                #   ※ plainNo(차량번호)는 서울시 API가 운행 종료 후에도 지우지 않고 남겨두는
+                #     경우가 있어 신뢰도가 낮습니다. arrmsg가 실시간 운행 상태를 더 정확히 반영하므로
+                #     arrmsg 기준만으로 단일화하여 유령 차량번호로 인한 오판정을 방지합니다.
+                NO_BUS_MSGS = {"운행정보없음", "운행종료", "출발대기", "-", ""}
                 arr_items = root_arr.findall(".//itemList")
-                # 한 항목이라도 arrmsg1 또는 arrmsg2 가 NO_BUS_MSGS 밖의 값이면 운행 중
                 has_active_bus = any(
                     (item.findtext("arrmsg1") or "").strip() not in NO_BUS_MSGS
                     or (item.findtext("arrmsg2") or "").strip() not in NO_BUS_MSGS
                     for item in arr_items
                 )
-                # ARR1이 운행종료로 판정 → POS 루프에서 건너뛰도록 기록
-                if not has_active_bus:
-                    arr_ended_rids.add(rid)
                 if rid in self.pos_suspend_until:
                     if has_active_bus:
                         del self.pos_suspend_until[rid]
-                        self.log(f"🔄 {rnm}번 운행 재개 확인 → POS 정지 해제")
+                        self.log(f"🔄 {rnm}번 운행 재개 확인")
                     # else: 아직 운행 정보 없음 → 정지 유지 (불필요한 로그 없음)
                 for item in root_arr.findall(".//itemList"):
                     res_ars  = str(item.findtext("arsId") or "").zfill(5)
@@ -1603,12 +2117,6 @@ class SeoulBusArrivalRecorder:
 
             for rid, rnm, st_cnt in info.get('routes', []):
                 root_pos = None
-
-                # 5-18-3-1-0. [ARR1 운행종료 확인] ARR1에서 운행종료로 판정된 노선은 POS 호출 생략.
-                #   서울시 API 오류로 arrmsg="운행종료"임에도 차량번호가 응답에 남아있는 경우가 있어,
-                #   plainNo 대신 arrmsg 기준으로 판정한 결과를 사용합니다.
-                if rid in arr_ended_rids:
-                    continue
 
                 # 5-18-3-1-1. [POS 정지 확인] 첫차 시각 이전이면 호출 건너뜁니다.
                 now_dt = datetime.now()
@@ -1686,11 +2194,16 @@ class SeoulBusArrivalRecorder:
 
                             # 5-18-3-3-4. 도착 기록판에 한 줄 적고 엑셀에도 자동으로 저장합니다.
                             log_entry = (f_time, rnm, veh_no, corp_nm, "정류소 도착")
-                            self.recorded_data.append((f_time, info['nm'], rnm, veh_no, corp_nm, "정류소 도착"))
+                            self.recorded_data.append((f_time, info['nm'], rnm, veh_no, corp_nm))
                             self.last_arrival_logs[idx][veh_no] = time.time()
                             self.perform_auto_save()
-                            self.log(f"★ 정류소 {idx+1} 도착: {rnm} ({veh_no})")
-                            self.root.after(0, lambda r=log_entry, t=self.trees_hist[idx]: t.insert("", 0, values=r))
+                            self.log(f"★ [{info['nm']}] 도착: {rnm} ({veh_no})")
+                            # 5-18-3-3-4-1. "end" 로 변경하여 오래된 기록이 위, 새 기록이 아래에 누적됩니다 (오름차순)
+                            # 5-18-3-3-4-2. 삽입 후 see()로 스크롤을 새 항목 위치로 자동 이동합니다.
+                            self.root.after(0, lambda r=log_entry, t=self.trees_hist[idx]: (
+                                t.insert("", "end", values=r),
+                                t.see(t.get_children()[-1])
+                            ))
        
     # 5-19. [공동배차확인용 엑셀 파일 부르기] 버스 회사 정보를 담은 엑셀을 뒷단에서 몰래 받아오기 시작하는 함수
     def start_excel_download_thread(self):
@@ -1878,7 +2391,7 @@ class SeoulBusArrivalRecorder:
         self.auto_save_path = os.path.join(self.current_dir, filename)
         
         try:
-            pd.DataFrame(columns=["데이터시각", "정류소명", "노선", "차량번호", "운수사명", "상태"]).to_excel(self.auto_save_path, index=False)
+            pd.DataFrame(columns=["데이터시각", "도착정류소명", "노선", "차량번호", "운수사명"]).to_excel(self.auto_save_path, index=False)
             self.can_auto_save = True 
             display_name = os.path.basename(self.auto_save_path)
             self.lbl_auto_save_status.config(text=f"[{display_name}] 파일에 자동 기록 중 ......", fg="#27ae60")
@@ -1938,17 +2451,49 @@ class SeoulBusArrivalRecorder:
         #   pos_suspend_until 에 등록된 노선이 ARR1 응답에서 새로 보이면 정지를 해제합니다.
         #   (실제 체크는 process_station 내부에서 수행하며, 여기서는 플래그만 기록합니다.)
 
-        # 5-25-1. 정류소 1번과 2번을 차례대로 확인합니다.
-        for i in range(2):
-            if self.target_st_info[i].get('routes'): 
-                self.process_station(i) 
-        
-        # 5-25-2. 자동으로 갱신될 때만 로그를 남깁니다. (너무 많이 남으면 지저분하니까요.)
-        if not manual:
-            self.log("데이터 갱신 완료")
+        # 5-25-0-1. [스레드 안전] _refresh_lock 으로 자동/수동 갱신이 동시 진입하지 못하게 막습니다.
+        #   수동 갱신이 자동 갱신과 겹치면 last_arrival_logs / veh_cache 등의 공유 상태를
+        #   두 스레드가 동시에 읽고 쓸 수 있어 중복 기록 또는 누락이 발생할 수 있습니다.
+        if not self._refresh_lock.acquire(blocking=False):
+            # 이미 다른 스레드가 갱신 중 → 이번 호출은 건너뜁니다.
+            if manual:
+                self.log("ℹ 자동 갱신 진행 중이므로 수동 갱신을 건너뜁니다.")
+            return
+
+        try:
+            # 5-25-1. 정류소 1번과 2번을 차례대로 확인합니다.
+            for i in range(2):
+                if self.target_st_info[i].get('routes'): 
+                    self.process_station(i) 
+            
+            # 5-25-2. [이중 저장 보호 — 구제 저장] 사이클이 끝난 뒤에도 미저장 기록이 있으면 재시도합니다.
+            #   process_station() 내부에서 perform_auto_save()를 즉시 호출하지만,
+            #   PermissionError나 OS 쓰기 오류로 저장이 실패했다면 recorded_data의 크기가
+            #   _saved_record_count보다 크게 됩니다. 이를 감지해 구제 저장을 실행합니다.
+            #   최악의 경우에도 누락 데이터는 다음 사이클 종료까지만 지연됩니다.
+            if (self.recorded_data
+                    and self.auto_save_path
+                    and self.can_auto_save
+                    and len(self.recorded_data) > self._saved_record_count):
+                missed = len(self.recorded_data) - self._saved_record_count
+                self.log(f"⚠ 미저장 기록 {missed}건 감지 → 구제 저장 재시도 중...")
+                self.perform_auto_save()
+                if len(self.recorded_data) == self._saved_record_count:
+                    self.log(f"✅ 구제 저장 성공: {missed}건 복구 완료")
+                else:
+                    self.log(f"❌ 구제 저장도 실패 — 다음 사이클에 재시도됩니다.")
+
+            # 5-25-3. 자동으로 갱신될 때만 로그를 남깁니다. (너무 많이 남으면 지저분하니까요.)
+            if not manual:
+                self.log("데이터 갱신 완료")
+        finally:
+            self._refresh_lock.release()
 
     # 5-26. [기록 멈춤] 하던 일을 멈추고 쉬는 단계로 돌아가는 함수
     def stop_monitoring(self):
+        # 5-26-0-0. [중지 확인] 실수 클릭 방지를 위해 한 번 더 확인합니다.
+        if not messagebox.askyesno("중지 확인", "정말 중지하시겠습니까?"):
+            return
         self.is_monitoring = False
         # 자동 기록 중지 후 키가 잠긴 상태면 검색 버튼을 다시 활성화합니다.
         if self.key_locked:
@@ -1957,6 +2502,21 @@ class SeoulBusArrivalRecorder:
             for _b in self.btn_searches:
                 _b.config(state="normal", **_s_on2)
         self.log("🛑 자동 기록을 중지합니다.")
+
+        # 5-26-0. [최종 구제 저장] 모니터링 중지 시점에도 미저장 기록이 있으면 마지막으로 저장합니다.
+        #   마지막 사이클의 즉시 저장이 실패한 채로 중지하면 데이터가 영구 손실되므로
+        #   중지 직전에 한 번 더 강제 저장을 시도합니다.
+        if (self.recorded_data
+                and self.auto_save_path
+                and self.can_auto_save
+                and len(self.recorded_data) > self._saved_record_count):
+            missed = len(self.recorded_data) - self._saved_record_count
+            self.log(f"⚠ 중지 시점 미저장 기록 {missed}건 → 최종 구제 저장 시도 중...")
+            self.perform_auto_save()
+            if len(self.recorded_data) == self._saved_record_count:
+                self.log(f"✅ 최종 구제 저장 성공: {missed}건 복구 완료")
+            else:
+                self.log(f"❌ 최종 구제 저장 실패 — '다른 이름으로 엑셀 저장' 버튼으로 수동 저장해 주세요.")
         
         # 5-26-1. 이제 주기를 다시 고칠 수 있게 입력창을 엽니다.
         self.entry_refresh_interval.config(state='normal')
@@ -2045,7 +2605,7 @@ class SeoulBusArrivalRecorder:
             from openpyxl.styles import Font, PatternFill, Alignment
 
             # 5-31-1. 우리가 모은 기록들을 엑셀 표 모양으로 정리합니다.
-            cols = ["데이터시각", "정류소명", "노선", "차량번호", "운수사명", "상태"]
+            cols = ["데이터시각", "도착정류소명", "노선", "차량번호", "운수사명"]
             df = pd.DataFrame(self.recorded_data, columns=cols)
             
             # 5-31-2. [영업일 계산] 새벽 3시 전에 들어온 버스는 '어제' 버스로 쳐줍니다.
@@ -2092,8 +2652,9 @@ class SeoulBusArrivalRecorder:
                         # 5-31-3-2-1. 정류소 이름처럼 긴 글자는 더 넓게, 시각은 좁게 개별 조절합니다.
                         if col == "데이터시각":
                             adjusted_width = base_width + 1 
-                        elif col == "정류소명":
-                            adjusted_width = base_width + 15
+                        elif col == "도착정류소명":
+                            # 기존 너비(base_width + 15)의 1.5배로 확장합니다.
+                            adjusted_width = (base_width + 15) * 1.5
                         elif col == "노선":
                             adjusted_width = base_width + 8 
                         elif col == "운수사명":
@@ -2128,14 +2689,28 @@ class SeoulBusArrivalRecorder:
                                 cell = ws.cell(row=1, column=ci+1)
                                 cell.fill = hfill; cell.font = hfont; cell.alignment = halign
                                 max_len = day_df[col].astype(str).map(len).max()
+                                base_w  = max(max_len, len(str(col)))
+                                if col == "도착정류소명":
+                                    col_w = (base_w + 15) * 1.5
+                                elif col == "데이터시각":
+                                    col_w = base_w + 1
+                                elif col == "노선":
+                                    col_w = base_w + 8
+                                elif col == "운수사명":
+                                    col_w = base_w + 7
+                                else:
+                                    col_w = base_w + 5
                                 col_letter = ws.cell(row=1, column=ci+1).column_letter
-                                ws.column_dimensions[col_letter].width = max(max_len, len(str(col))) + 5
+                                ws.column_dimensions[col_letter].width = col_w
                         # 5-31-4-3. 저장 성공 시 중복 저장 방지 집합에 추가합니다.
                         self._completed_dates_saved.add(biz_date)
                         self.log(f"📁 영업일 완결 파일 저장: {completed_name}")
                     except Exception as ce:
                         self.log(f"⚠ 완결 파일 저장 실패 ({biz_date}): {ce}")
 
+            # 5-31-5. [저장 성공 확인] 저장 성공 시 _saved_record_count를 갱신합니다.
+            #   이 값은 refresh_data() 사이클 종료 시 누락 여부 판단에 사용됩니다.
+            self._saved_record_count = len(self.recorded_data)
             return True
 
         except PermissionError:
@@ -2171,10 +2746,20 @@ class SeoulBusArrivalRecorder:
         if not self.recorded_data or not self.auto_save_path or not self.can_auto_save: 
             return 
         
-        # 5-33-2. 소리 없이 조용히 파일에 기록합니다.
-        #         save_completed=True 로 전달해 완결된 영업일 파일도 함께 저장합니다.
-        if self._core_excel_save_logic(self.auto_save_path, save_completed=True):
-            pass
+        # 5-33-2. [스레드 안전] _save_lock 으로 한 스레드씩만 파일을 씁니다.
+        #   자동 모니터링 스레드와 수동 갱신 스레드가 동시에 파일을 덮어써
+        #   더 이른 스냅샷이 나중에 기록되면 데이터가 사라지는 버그를 방지합니다.
+        #   lock 취득 전에 재진입 여부를 확인해 불필요한 중복 저장을 줄입니다.
+        if not self._save_lock.acquire(blocking=False):
+            # 다른 스레드가 이미 저장 중 → 대기하지 않고 건너뜁니다.
+            # 해당 스레드가 완료될 때 recorded_data 의 전체 스냅샷을 포함하므로 데이터 손실은 없습니다.
+            return
+        try:
+            # 5-33-3. 소리 없이 조용히 파일에 기록합니다.
+            #         save_completed=True 로 전달해 완결된 영업일 파일도 함께 저장합니다.
+            self._core_excel_save_logic(self.auto_save_path, save_completed=True)
+        finally:
+            self._save_lock.release()
 
     # 5-34. [표 새로고침] 표의 내용을 다 지우고 새로운 버스 정보로 채우는 함수
     def refresh_tree(self, tree, data):
@@ -2252,5 +2837,3 @@ if __name__ == "__main__":
         root.mainloop()
     except Exception as e:
         _write_error_log(type(e), e, e.__traceback__)
-
-   
