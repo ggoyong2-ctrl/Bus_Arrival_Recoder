@@ -16,6 +16,7 @@ from urllib.parse import unquote # N. [URL 디코딩 도구] 인증키에 포함
 # O. [운영체제 판별] platform.system() 호출 결과를 전역 변수에 저장합니다.
 #    "Windows" → 윈도우, "Darwin" → macOS, "Linux" → 리눅스.
 #    이후 글꼴 설정, 버튼 위젯 선택, 커서 모양, 경로 처리 등 OS별 분기에 반복 사용됩니다.
+#    [선택]맥os 앱 실행 권한(Gatekeeper) 격리 속성 제거 터미널 명령어 xattr -d com.apple.quarantine /경로/to/your/app_file(혹은 드래그)
 CURRENT_OS = platform.system()
 
 # P. [OS별 글꼴 및 글자 크기 설정] 운영체제에 따라 화면에 표시할 글꼴 이름과 크기를 다르게 지정합니다.
